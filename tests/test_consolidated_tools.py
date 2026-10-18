@@ -11,7 +11,7 @@ from blender_mcp.openai_apps import is_app_only
 MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
-    "gn_get_tree",
+    "gn_get_tree", "gn_build_tree", "gn_set_inputs", "gn_list_node_types", "gn_get_evaluated_info",
 }
 
 
@@ -36,7 +36,8 @@ def test_guides_are_off_for_now():
 def test_scripts_compile_and_never_raise_systemexit():
     # The addon catches Exception around execute_code but not SystemExit.
     for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS,
-                   blender_scripts.GN_TREE):
+                   blender_scripts.GN_TREE, blender_scripts.GN_BUILD, blender_scripts.GN_SET_INPUTS,
+                   blender_scripts.GN_NODE_TYPES, blender_scripts.GN_EVALUATED):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code
@@ -113,7 +114,7 @@ def test_gn_get_tree_needs_exactly_one_target(monkeypatch):
 def test_gn_get_tree_passes_the_target_and_reports_script_errors(monkeypatch):
     sent = []
 
-    def fake_run(script, args):
+    def fake_run(script, args, read_only=True):
         sent.append(args)
         if args["tree"] == "Missing":
             return {"error": "no node group named 'Missing'"}
@@ -124,6 +125,33 @@ def test_gn_get_tree_passes_the_target_and_reports_script_errors(monkeypatch):
     assert sent[-1] == {"object": "Ground", "modifier": "GN", "tree": None, "include_nested": False}
     assert json.loads(reply)["tree"]["name"] == "Scatter"
     assert asyncio.run(server.gn_get_tree(None, tree="Missing")) == "Error: no node group named 'Missing'"
+
+
+def test_gn_tools_mark_only_edits_as_edits(monkeypatch):
+    calls = {}
+
+    def fake_run(script, args, read_only=True):
+        calls[script] = read_only
+        return {}
+
+    monkeypatch.setattr(server, "_run_script", fake_run)
+    asyncio.run(server.gn_get_tree(None, tree="T"))
+    asyncio.run(server.gn_build_tree(None, spec={}, tree="T"))
+    asyncio.run(server.gn_set_inputs(None, tree="T", node_props={"Math": {"operation": "ADD"}}))
+    asyncio.run(server.gn_list_node_types(None))
+    asyncio.run(server.gn_get_evaluated_info(None, object="Cube"))
+    assert calls == {blender_scripts.GN_TREE: True, blender_scripts.GN_BUILD: False,
+                     blender_scripts.GN_SET_INPUTS: False, blender_scripts.GN_NODE_TYPES: True,
+                     blender_scripts.GN_EVALUATED: True}
+
+
+def test_gn_errors_keep_what_the_script_reported(monkeypatch):
+    monkeypatch.setattr(server, "_run_script",
+                        lambda script, args, read_only=True: {"error": "no input 'X'", "changed": ["Math.operation"]})
+    reply = asyncio.run(server.gn_set_inputs(None, tree="T", node_inputs={"Math": {"X": 1}}))
+    assert reply == 'Error: no input \'X\' {"changed": ["Math.operation"]}'
+    assert asyncio.run(server.gn_set_inputs(None, tree="T")).startswith("Error: nothing to set")
+    assert asyncio.run(server.gn_build_tree(None, spec={})).startswith("Error: give exactly one")
 
 
 class _Blender:

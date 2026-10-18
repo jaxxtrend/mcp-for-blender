@@ -569,10 +569,14 @@ def missing_feature(what: str, sidebar_label: str | None = None) -> str:
     return reply
 
 
-def _run_script(script: str, args: dict) -> dict:
-    """Run one of blender_scripts' observation scripts and return its result."""
+def _run_script(script: str, args: dict, read_only: bool = True) -> dict:
+    """Run one of blender_scripts' scripts and return its result.
+
+    Scripts that change the scene pass read_only=False, so the Viewport app
+    treats them as edits.
+    """
     result = get_blender_connection().send_command(
-        "execute_code", {"code": blender_scripts.build(script, args)}, read_only=True)
+        "execute_code", {"code": blender_scripts.build(script, args)}, read_only=read_only)
     # Addons before April 2025 run code but don't return what it prints.
     if not isinstance(result, dict) or "result" not in result:
         raise AddonTooOld(missing_feature("this view"))
@@ -679,6 +683,18 @@ async def get_scene_info(
             pass
 
 
+def _gn_reply(script: str, args: dict, action: str, read_only: bool = True) -> str:
+    """Run a Geometry Nodes script; its JSON result, or the error it reports."""
+    try:
+        data = _run_script(script, args, read_only=read_only)
+    except Exception as e:
+        logger.error(f"Error {action}: {e}")
+        return f"Error {action}: {e}"
+    if data.get("error"):
+        return "Error: " + data.pop("error") + (f" {json.dumps(data)}" if data else "")
+    return json.dumps(data, separators=(",", ":"))
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def gn_get_tree(
     ctx: Context,
@@ -713,15 +729,139 @@ async def gn_get_tree(
     """
     if bool(object) == bool(tree):
         return "Error: give exactly one of object or tree"
-    try:
-        data = _run_script(blender_scripts.GN_TREE, {
-            "object": object, "modifier": modifier, "tree": tree, "include_nested": include_nested})
-    except Exception as e:
-        logger.error(f"Error reading node tree: {e}")
-        return f"Error reading node tree: {e}"
-    if data.get("error"):
-        return f"Error: {data['error']}"
-    return json.dumps(data, separators=(",", ":"))
+    return _gn_reply(blender_scripts.GN_TREE, {
+        "object": object, "modifier": modifier, "tree": tree, "include_nested": include_nested},
+        "reading node tree")
+
+
+@mcp.tool()
+async def gn_build_tree(
+    ctx: Context,
+    spec: dict,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Build a whole Geometry Nodes tree in one call from a spec in gn_get_tree's "tree" format. Use it
+    to make a new tree or to change an existing one: read it with gn_get_tree, edit the JSON, and
+    send it back whole. The spec replaces all nodes and links of the tree.
+
+    Give exactly one of object or tree:
+    - object: builds the tree of that object's Geometry Nodes modifier (modifier= picks one when
+      there are several). An object without one gets a new modifier ("GeometryNodes", or the
+      modifier name you give) with a new tree.
+    - tree: the node group to build, created if it doesn't exist.
+
+    Spec:
+    - name: optional; renames the tree.
+    - interface: [{"in_out": "INPUT"|"OUTPUT", "name", "type": "NodeSocketFloat"..., "id"?,
+      "default"?, "min"?, "max"?, "default_input"?, "in_panel"?}, {"panel": name, "in_panel"?}].
+      Keep the "id" of existing sockets: they keep their values on modifiers. New sockets need no id.
+      In each panel, Blender puts sockets before sub-panels.
+    - nodes: [{"name", "type": bl_idname, "location"?, "label"?, "parent"? (a frame), "mute"?,
+      "props"? {setting: value}, "inputs"? [{"id": socket id or name, "value"}]}]. Names must be
+      unique. Zones: give the zone input "props": {"paired_output": "<output node name>"}, and put
+      zone items (repeat_items, state_items ...) in the output node's props as lists of dicts.
+    - links: [{"from": [node, output id or name], "to": [node, input id or name], "muted"?}].
+    Use gn_list_node_types for node type names, settings and socket ids.
+
+    It builds on a copy and swaps it in only when everything worked, so an error leaves the tree
+    as it was. Returns the interface with the socket ids it ended up with, and any invalid links.
+
+    Parameters:
+    - spec: The tree, as described above.
+    - object: Object whose Geometry Nodes modifier to build.
+    - modifier: Modifier name, when the object has several, or the name for a new one.
+    - tree: Node group to build instead.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    return _gn_reply(blender_scripts.GN_BUILD,
+                     {"spec": spec, "object": object, "modifier": modifier, "tree": tree},
+                     "building node tree", read_only=False)
+
+
+@mcp.tool()
+async def gn_set_inputs(
+    ctx: Context,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    modifier_inputs: dict | None = None,
+    node_inputs: dict | None = None,
+    node_props: dict | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Change values in a Geometry Nodes tree without rebuilding it: modifier inputs, unlinked node
+    inputs and node settings. Give exactly one of object or tree, as in gn_get_tree.
+
+    Parameters:
+    - modifier_inputs: {interface input id or name: value} on the object's modifier. Objects,
+      collections, materials and images are given by name. {"attribute": "name"} makes a field
+      input read that attribute; a plain value switches it back. Needs object=.
+    - node_inputs: {node name: {input id or name: value}}.
+    - node_props: {node name: {setting: value}}, e.g. {"Math": {"operation": "ADD"}}. Settings
+      can add or remove sockets, so read the tree again before linking to them.
+    - object / modifier / tree: Which tree, as in gn_get_tree.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+
+    Applies in the order node_props, node_inputs, modifier_inputs and stops at the first error,
+    which lists what was already changed.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    if not (modifier_inputs or node_inputs or node_props):
+        return "Error: nothing to set: give modifier_inputs, node_inputs or node_props"
+    return _gn_reply(blender_scripts.GN_SET_INPUTS, {
+        "object": object, "modifier": modifier, "tree": tree, "modifier_inputs": modifier_inputs,
+        "node_inputs": node_inputs, "node_props": node_props}, "setting inputs", read_only=False)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_list_node_types(
+    ctx: Context,
+    query: str | None = None,
+    node_type: str | None = None,
+    props: dict | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Node types a Geometry Nodes tree can hold in the user's Blender version, or the details of one.
+    Names and sockets change between Blender versions, so look them up instead of guessing.
+
+    Without node_type: [bl_idname, label] pairs; query="distribute points" keeps types whose
+    bl_idname or label contains every word.
+    With node_type: its settings (current value and enum choices) and its inputs and outputs
+    (id, name, type, default). Sockets depend on mode-like settings: pass the settings you will
+    use in props (e.g. {"data_type": "VECTOR"}) to see the sockets for that mode.
+
+    Parameters:
+    - query: Words to filter the list by.
+    - node_type: A bl_idname, e.g. "GeometryNodeDistributePointsOnFaces".
+    - props: Settings to apply before describing node_type's sockets.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_NODE_TYPES, {"query": query, "node_type": node_type, "props": props},
+                     "listing node types")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_get_evaluated_info(ctx: Context, object: str, user_prompt: str = "") -> str:
+    """
+    What an object's modifiers produced, as numbers: vertices, edges, faces of the mesh, points of
+    point clouds and curves, their attributes (name, domain, type), instances counted by what they
+    instance, and the world bounding box including instances. Use it to check a Geometry Nodes
+    result; use look to see it. Needs Blender 4.3 or newer.
+
+    Parameters:
+    - object: The object to check.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_EVALUATED, {"object": object}, "reading evaluated geometry")
 
 
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:

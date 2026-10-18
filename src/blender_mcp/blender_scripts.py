@@ -550,17 +550,26 @@ for name in ARGS["names"]:
 return out
 '''
 
-
-# A Geometry Nodes tree as JSON: interface, nodes with their settings and the
-# values of unlinked inputs, and links by socket identifier. Given an object it
-# also reports the values set on the modifier. Hidden (disabled) sockets are left
-# out, since the node's current mode doesn't use them.
-GN_TREE = r'''
+# Shared by the Geometry Nodes scripts below: turning bpy values into JSON and
+# back, and finding the tree, nodes and sockets a call names. Request mistakes
+# raise GNError, which each script turns into {"error": ...}.
+_GN_COMMON = r'''
 import bpy
 import mathutils
 
 if bpy.app.version < (4, 0, 0):
     return {"error": f"Blender {bpy.app.version_string} is not supported: needs 4.0 or newer"}
+
+class GNError(Exception):
+    pass
+
+# Base node properties, plus which list item is selected in the sidebar: UI state, not part of the tree.
+BASE_NODE_PROPS = set(bpy.types.Node.bl_rna.properties.keys()) | {"active_index", "active_item", "inspection_index"}
+# How a property the tree dump can't express is shown, e.g. "(TexMapping, not shown)".
+NOT_SHOWN = ", not shown)"
+FLT_MAX = 3.4028234663852886e+38
+ID_SOCKETS = {"OBJECT": "Object", "COLLECTION": "Collection", "MATERIAL": "Material", "IMAGE": "Image",
+              "TEXTURE": "Texture"}
 
 def value(v):
     if isinstance(v, bpy.types.ID):
@@ -573,9 +582,169 @@ def value(v):
         return [[round(x, 4) for x in row] for row in v]
     return [value(x) for x in v]
 
-def color_ramp(ramp):
-    return {"interpolation": ramp.interpolation, "color_mode": ramp.color_mode,
-            "elements": [[round(e.position, 4), value(e.color)] for e in ramp.elements]}
+def id_by_name(struct_id, name):
+    """Object "Cube" -> bpy.data.objects["Cube"]; finds the bpy.data collection from its RNA type."""
+    if name is None:
+        return None
+    for prop in bpy.data.bl_rna.properties:
+        if prop.type == "COLLECTION" and prop.fixed_type.identifier == struct_id:
+            found = getattr(bpy.data, prop.identifier).get(name)
+            if found is None:
+                raise GNError(f"no {struct_id} named {name!r}")
+            return found
+    raise GNError(f"no bpy.data collection holds {struct_id}")
+
+def to_socket_value(socket_type, v):
+    """A JSON value for a socket of this type ("OBJECT" or "NodeSocketObject"): names become IDs."""
+    id_type = ID_SOCKETS.get(socket_type.upper().replace("NODESOCKET", ""))
+    return id_by_name(id_type, v) if id_type else v
+
+def find_object(name):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        raise GNError(f"no object named {name!r}")
+    return obj
+
+def gn_modifiers(obj):
+    return [m for m in obj.modifiers if m.type == "NODES"]
+
+def find_modifier(obj, mod_name):
+    mods = gn_modifiers(obj)
+    if mod_name:
+        for m in mods:
+            if m.name == mod_name:
+                return m
+        raise GNError(f"{obj.name!r} has no Geometry Nodes modifier {mod_name!r}; it has: {[m.name for m in mods]}")
+    if len(mods) == 1:
+        return mods[0]
+    raise GNError(f"{obj.name!r} has {len(mods)} Geometry Nodes modifiers, pass modifier=: {[m.name for m in mods]}")
+
+def check_gn_tree(tree):
+    if tree.bl_idname != "GeometryNodeTree":
+        raise GNError(f"{tree.name!r} is a {tree.bl_idname}, not a Geometry Nodes tree")
+    return tree
+
+def find_tree(args):
+    """(tree, object, modifier) for a call naming either an object or a node group."""
+    obj_name, tree_name = args.get("object"), args.get("tree")
+    if bool(obj_name) == bool(tree_name):
+        raise GNError("give exactly one of object or tree")
+    if tree_name:
+        tree = bpy.data.node_groups.get(tree_name)
+        if tree is None:
+            raise GNError(f"no node group named {tree_name!r}")
+        return check_gn_tree(tree), None, None
+    obj = find_object(obj_name)
+    mod = find_modifier(obj, args.get("modifier"))
+    if mod.node_group is None:
+        raise GNError(f"modifier {mod.name!r} on {obj.name!r} has no node group")
+    return check_gn_tree(mod.node_group), obj, mod
+
+def find_node(tree, name):
+    node = tree.nodes.get(name)
+    if node is None:
+        raise GNError(f"{tree.name!r} has no node named {name!r}")
+    return node
+
+def find_socket(node, key, output=False):
+    """A socket by identifier, or by name when that name is unique among the enabled sockets."""
+    side = "output" if output else "input"
+    # NodeSocketVirtual is the empty "add a socket" slot on group input/output nodes.
+    sockets = [s for s in (node.outputs if output else node.inputs) if s.bl_idname != "NodeSocketVirtual"]
+    for s in sockets:
+        if s.identifier == key:
+            if not s.enabled:
+                raise GNError(f"{side} {key!r} of {node.name!r} is disabled in the node's current mode")
+            return s
+    named = [s for s in sockets if s.enabled and s.name == key]
+    if len(named) == 1:
+        return named[0]
+    available = [s.identifier if s.name == s.identifier else f"{s.identifier} ({s.name})"
+                 for s in sockets if s.enabled]
+    if named:
+        raise GNError(f"{side} name {key!r} is ambiguous on {node.name!r}, use an id: {available}")
+    raise GNError(f"{node.name!r} has no {side} {key!r}; it has: {available}")
+
+def set_socket_value(socket, v):
+    if not hasattr(socket, "default_value"):
+        raise GNError(f"input {socket.identifier!r} of {socket.node.name!r} has no value to set")
+    socket.default_value = to_socket_value(socket.type, v)
+
+def set_color_ramp(ramp, v):
+    want = v["elements"]
+    if not want:
+        raise GNError("a color ramp needs at least one element")
+    ramp.color_mode = v["color_mode"]
+    ramp.interpolation = v["interpolation"]
+    elements = ramp.elements
+    while len(elements) > 1:
+        elements.remove(elements[-1])
+    elements[0].position, elements[0].color = want[0]
+    for position, color in want[1:]:
+        # new() inserts sorted by position; set the color before the next insert moves things.
+        elements.new(position).color = color
+
+def set_curve_mapping(mapping, v):
+    curves = v["curves"]
+    if len(curves) != len(mapping.curves):
+        raise GNError(f"this mapping has {len(mapping.curves)} curves, got {len(curves)}")
+    for curve, points in zip(mapping.curves, curves):
+        if len(points) < 2:
+            raise GNError("a curve needs at least two points")
+        while len(curve.points) > len(points):
+            curve.points.remove(curve.points[-1])
+        while len(curve.points) < len(points):
+            curve.points.new(0.5, 0.5)
+        for point, location in zip(curve.points, points):
+            point.location = location
+    mapping.update()
+
+def set_items(node, key, items):
+    """Recreate a node's item list (repeat_items, capture_items, enum_items ...) from dicts."""
+    coll = getattr(node, key)
+    functions = node.bl_rna.properties[key].srna.functions
+    if "new" not in functions:
+        raise GNError(f"{key} of {node.name!r} can't be changed")
+    params = [p.identifier for p in functions["new"].parameters if not p.is_output]
+    coll.clear()
+    for item in items:
+        args = {p: item[p] for p in params if p in item}
+        if "socket_type" in params and "socket_type" not in args and "data_type" in item:
+            # Capture and grid items are typed by data_type, which is set below, but new() still wants a socket_type.
+            args["socket_type"] = "FLOAT"
+        missing = [p for p in params if p not in args]
+        if missing:
+            raise GNError(f"{key} items of {node.name!r} need {missing}")
+        new = coll.new(**args)
+        for k, v in item.items():
+            if k not in args:
+                setattr(new, k, v)
+
+def set_node_prop(node, key, v):
+    prop = node.bl_rna.properties.get(key)
+    if prop is None or key in BASE_NODE_PROPS:
+        raise GNError(f"{node.bl_idname} has no property {key!r}")
+    if isinstance(v, str) and v.endswith(NOT_SHOWN):
+        return
+    try:
+        if prop.type == "COLLECTION":
+            set_items(node, key, v)
+        elif prop.type == "POINTER":
+            target = getattr(node, key)
+            if isinstance(target, bpy.types.ColorRamp):
+                set_color_ramp(target, v)
+            elif isinstance(target, bpy.types.CurveMapping):
+                set_curve_mapping(target, v)
+            elif prop.is_readonly:
+                raise GNError("it can't be set")
+            else:
+                setattr(node, key, id_by_name(prop.fixed_type.identifier, v))
+        elif prop.type == "ENUM" and prop.is_enum_flag:
+            setattr(node, key, set(v))
+        else:
+            setattr(node, key, v)
+    except (GNError, TypeError, ValueError, AttributeError, RuntimeError, KeyError) as e:
+        raise GNError(f"node {node.name!r}, property {key!r}: {e}")
 
 def simple_props(struct, skip=()):
     out = {}
@@ -583,11 +752,9 @@ def simple_props(struct, skip=()):
         key = prop.identifier
         if key in skip or key == "rna_type" or prop.type in {"POINTER", "COLLECTION"} or prop.is_readonly:
             continue
-        out[key] = value(getattr(struct, key))
+        v = getattr(struct, key)
+        out[key] = sorted(v) if isinstance(v, set) else value(v)
     return out
-
-# Base node properties, plus which list item is selected in the sidebar: UI state, not part of the tree.
-BASE_NODE_PROPS = set(bpy.types.Node.bl_rna.properties.keys()) | {"active_index", "active_item", "inspection_index"}
 
 def node_props(node):
     out = simple_props(node, BASE_NODE_PROPS)
@@ -597,15 +764,20 @@ def node_props(node):
             continue
         if prop.type == "POINTER":
             v = getattr(node, key)
-            if v is None or isinstance(v, (bpy.types.ID, bpy.types.Node)):
+            if isinstance(v, bpy.types.Node):
+                # Zone inputs point at their output; other node pointers (enum_definition) point back at the node.
+                if key == "paired_output":
+                    out[key] = v.name
+            elif v is None or isinstance(v, bpy.types.ID):
                 out[key] = None if v is None else v.name
             elif isinstance(v, bpy.types.ColorRamp):
-                out[key] = color_ramp(v)
+                out[key] = {"interpolation": v.interpolation, "color_mode": v.color_mode,
+                            "elements": [[round(e.position, 4), value(e.color)] for e in v.elements]}
             elif isinstance(v, bpy.types.CurveMapping):
                 out[key] = {"curves": [[[round(p.location.x, 4), round(p.location.y, 4)] for p in c.points]
                                        for c in v.curves]}
             else:
-                out[key] = f"({type(v).__name__}, not shown)"
+                out[key] = f"({type(v).__name__}{NOT_SHOWN}"
         elif prop.type == "COLLECTION":
             out[key] = [simple_props(item) for item in getattr(node, key)]
     return out
@@ -618,7 +790,10 @@ def socket_entry(socket, with_value):
         entry["value"] = value(socket.default_value)
     return entry
 
-def interface(tree):
+def shown_sockets(sockets):
+    return [s for s in sockets if s.enabled and s.bl_idname != "NodeSocketVirtual"]
+
+def dump_interface(tree):
     items = []
     for item in tree.interface.items_tree:
         parent = item.parent.name if item.parent and item.parent.parent else None
@@ -652,13 +827,10 @@ def dump_tree(tree):
         props = node_props(node)
         if props:
             entry["props"] = props
-        # NodeSocketVirtual is the empty "add a socket" slot on group input/output nodes.
-        inputs = [socket_entry(s, True) for s in node.inputs if s.enabled and s.bl_idname != "NodeSocketVirtual"]
-        inputs = [s for s in inputs if len(s) > 1]
+        inputs = [s for s in (socket_entry(s, True) for s in shown_sockets(node.inputs)) if len(s) > 1]
         if inputs:
             entry["inputs"] = inputs
-        outputs = [socket_entry(s, False) for s in node.outputs if s.enabled and s.bl_idname != "NodeSocketVirtual"]
-        outputs = [s for s in outputs if len(s) > 1]
+        outputs = [s for s in (socket_entry(s, False) for s in shown_sockets(node.outputs)) if len(s) > 1]
         if outputs:
             entry["outputs"] = outputs
         nodes.append(entry)
@@ -675,7 +847,7 @@ def dump_tree(tree):
         links.append(entry)
     groups = sorted({n.node_tree.name for n in tree.nodes
                      if n.bl_idname == "GeometryNodeGroup" and n.node_tree})
-    out = {"name": tree.name, "is_modifier": tree.is_modifier, "interface": interface(tree),
+    out = {"name": tree.name, "is_modifier": tree.is_modifier, "interface": dump_interface(tree),
            "nodes": nodes, "links": links}
     if tree.description:
         out["description"] = tree.description
@@ -683,29 +855,26 @@ def dump_tree(tree):
         out["uses_groups"] = groups
     return out
 
-obj_name, mod_name, tree_name = ARGS.get("object"), ARGS.get("modifier"), ARGS.get("tree")
-if bool(obj_name) == bool(tree_name):
-    return {"error": "give exactly one of object or tree"}
+def node_classes():
+    for name in dir(bpy.types):
+        cls = getattr(bpy.types, name)
+        if isinstance(cls, type) and issubclass(cls, bpy.types.Node) and cls is not bpy.types.Node:
+            yield name
+'''
+
+
+# A Geometry Nodes tree as JSON: interface, nodes with their settings and the
+# values of unlinked inputs, and links by socket identifier. Given an object it
+# also reports the values set on the modifier. Hidden (disabled) sockets are left
+# out, since the node's current mode doesn't use them.
+GN_TREE = _GN_COMMON + r'''
+try:
+    tree, obj, mod = find_tree(ARGS)
+except GNError as e:
+    return {"error": str(e)}
 
 result = {}
-if obj_name:
-    obj = bpy.data.objects.get(obj_name)
-    if obj is None:
-        return {"error": f"no object named {obj_name!r}"}
-    gn_mods = [m for m in obj.modifiers if m.type == "NODES"]
-    if mod_name:
-        mod = next((m for m in gn_mods if m.name == mod_name), None)
-        if mod is None:
-            return {"error": f"{obj.name!r} has no Geometry Nodes modifier {mod_name!r}; "
-                             f"it has: {[m.name for m in gn_mods]}"}
-    elif len(gn_mods) == 1:
-        mod = gn_mods[0]
-    else:
-        return {"error": f"{obj.name!r} has {len(gn_mods)} Geometry Nodes modifiers, pass modifier=: "
-                         f"{[m.name for m in gn_mods]}"}
-    if mod.node_group is None:
-        return {"error": f"modifier {mod.name!r} on {obj.name!r} has no node group"}
-    tree = mod.node_group
+if mod is not None:
     inputs = {}
     for item in tree.interface.items_tree:
         if item.item_type != "SOCKET" or item.in_out != "INPUT" or item.identifier not in mod.keys():
@@ -715,13 +884,6 @@ if obj_name:
             entry["attribute"] = mod[item.identifier + "_attribute_name"]
         inputs[item.identifier] = entry
     result["modifier"] = {"object": obj.name, "name": mod.name, "inputs": inputs}
-else:
-    tree = bpy.data.node_groups.get(tree_name)
-    if tree is None:
-        return {"error": f"no node group named {tree_name!r}"}
-
-if tree.bl_idname != "GeometryNodeTree":
-    return {"error": f"{tree.name!r} is a {tree.bl_idname}, not a Geometry Nodes tree"}
 
 result["tree"] = dump_tree(tree)
 if ARGS.get("include_nested"):
@@ -733,5 +895,404 @@ if ARGS.get("include_nested"):
         nested[name] = dump_tree(bpy.data.node_groups[name])
         queue.extend(nested[name].get("uses_groups", []))
     result["nested"] = list(nested.values())
+return result
+'''
+
+
+# Builds a whole tree from a spec in gn_get_tree's format. The build runs on a
+# copy, which replaces the original only once everything succeeded, so a bad
+# spec leaves the user's tree untouched. Interface sockets whose id matches an
+# existing one are kept (so values set on modifiers survive); links to group
+# input/output sockets are translated to the ids the interface ends up with.
+GN_BUILD = _GN_COMMON + r'''
+import re
+
+spec = ARGS["spec"]
+
+def sync_interface(tree, items):
+    iface = tree.interface
+    sockets = {i.identifier: i for i in iface.items_tree if i.item_type == "SOCKET"}
+    keep = {e["id"] for e in items if "panel" not in e and e.get("id") in sockets
+            and sockets[e["id"]].in_out == e["in_out"]}
+    panel_names = {e["panel"] for e in items if "panel" in e}
+    for item in [i for i in iface.items_tree if i.item_type == "SOCKET" and i.identifier not in keep]:
+        iface.remove(item)
+    for item in [i for i in iface.items_tree if i.item_type == "PANEL" and i.name not in panel_names]:
+        iface.remove(item)
+    sockets = {i.identifier: i for i in iface.items_tree if i.item_type == "SOCKET"}
+    panels = {i.name: i for i in iface.items_tree if i.item_type == "PANEL"}
+    id_map, placed = {}, []
+    for e in items:
+        if "panel" in e:
+            item = panels.get(e["panel"]) or iface.new_panel(e["panel"])
+            panels[e["panel"]] = item
+        else:
+            item = sockets.get(e.get("id"))
+            if item is None:
+                item = iface.new_socket(e["name"], in_out=e["in_out"], socket_type=e["type"])
+            else:
+                item.name = e["name"]
+                if item.socket_type != e["type"]:
+                    item.socket_type = e["type"]
+            if "default" in e:
+                item.default_value = to_socket_value(e["type"], e["default"])
+            # A kept socket must not keep old settings the spec leaves out (it omits "no limit" and VALUE).
+            if hasattr(item, "min_value"):
+                limit = 2**31 - 1 if isinstance(item.min_value, int) else FLT_MAX
+                item.min_value = e.get("min", -limit - isinstance(item.min_value, int))
+                item.max_value = e.get("max", limit)
+            if hasattr(item, "default_input"):
+                item.default_input = e.get("default_input", "VALUE")
+            if e.get("id"):
+                id_map[e["id"]] = item.identifier
+        placed.append((e, item))
+    if placed:
+        root = placed[0][1]
+        while root.parent is not None:
+            root = root.parent
+        positions = {}
+        for e, item in placed:
+            if e.get("in_panel") and e["in_panel"] not in panels:
+                raise GNError(f"interface item {e.get('name', e.get('panel'))!r} is in unknown panel {e['in_panel']!r}")
+            parent = panels[e["in_panel"]] if e.get("in_panel") else root
+            position = positions.get(parent.as_pointer(), 0)
+            iface.move_to_parent(item, parent, position)
+            positions[parent.as_pointer()] = position + 1
+    return id_map
+
+def build(tree):
+    id_map = sync_interface(tree, spec.get("interface", []))
+    specs = spec.get("nodes", [])
+    names = [e["name"] for e in specs]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise GNError(f"node names must be unique: {duplicates}")
+    tree.nodes.clear()
+    nodes = {}
+    for e in specs:
+        try:
+            node = tree.nodes.new(e["type"])
+        except RuntimeError as ex:
+            raise GNError(f"node {e['name']!r}: can't add a {e['type']!r} to a Geometry Nodes tree ({ex})")
+        node.name = e["name"]
+        node.label = e.get("label", "")
+        node.mute = e.get("mute", False)
+        nodes[e["name"]] = node
+
+    def node_named(name, used_by):
+        if name not in nodes:
+            raise GNError(f"{used_by} names unknown node {name!r}")
+        return nodes[name]
+
+    def props_of(e):
+        return (e.get("props") or {}).items()
+
+    # Socket ids can come out different from the spec's: recreated item lists
+    # (zones, capture, menu switch) number their sockets on. The spec names
+    # every socket whose name differs from its id, so a socket whose id now
+    # belongs to a differently named socket is found by its name instead.
+    spec_names = {(e["name"], side): {s["id"]: s["name"] for s in e.get(side, []) if "name" in s}
+                  for e in specs for side in ("inputs", "outputs")}
+
+    def socket(node, key, output=False):
+        if node.bl_idname in {"NodeGroupInput", "NodeGroupOutput"} and key in id_map:
+            return find_socket(node, id_map[key], output)
+        name = spec_names[(node.name, "outputs" if output else "inputs")].get(key)
+        sockets = node.outputs if output else node.inputs
+        by_id = next((s for s in sockets if s.identifier == key), None)
+        if name is None or (by_id is not None and by_id.name == name):
+            return find_socket(node, key, output)
+        # Item lists of one node can share names (a For Each zone's Main and
+        # Generation items), so prefer the socket from the same list: same id prefix.
+        named = [s for s in shown_sockets(sockets) if s.name == name]
+        same_list = [s for s in named if re.sub(r"_\d+$", "", s.identifier) == re.sub(r"_\d+$", "", key)]
+        if len(named) > 1 and len(same_list) == 1:
+            return same_list[0]
+        return find_socket(node, name, output)
+
+    # Settings first (they decide which sockets exist), then zone pairs and
+    # item lists, then layout, input values and links.
+    for e in specs:
+        node = nodes[e["name"]]
+        for key, v in props_of(e):
+            prop = node.bl_rna.properties.get(key)
+            if key != "paired_output" and not (prop and prop.type == "COLLECTION"):
+                set_node_prop(node, key, v)
+    for e in specs:
+        output = (e.get("props") or {}).get("paired_output")
+        if output and not nodes[e["name"]].pair_with_output(node_named(output, f"zone {e['name']!r}")):
+            raise GNError(f"can't pair zone input {e['name']!r} with {output!r}")
+    for e in specs:
+        node = nodes[e["name"]]
+        for key, v in props_of(e):
+            prop = node.bl_rna.properties.get(key)
+            if prop and prop.type == "COLLECTION":
+                set_node_prop(node, key, v)
+    for e in specs:
+        node = nodes[e["name"]]
+        if e.get("parent"):
+            node.parent = node_named(e["parent"], f"node {e['name']!r}")
+        if "location" in e:
+            node.location = e["location"]
+    for e in specs:
+        node = nodes[e["name"]]
+        for s in e.get("inputs", []):
+            if "value" in s:
+                target = socket(node, s["id"])
+                try:
+                    set_socket_value(target, s["value"])
+                except (TypeError, ValueError, AttributeError) as ex:
+                    raise GNError(f"node {node.name!r}, input {s['id']!r}: {ex}")
+    links = spec.get("links", [])
+    # Multi-input sockets order their links by when they were made.
+    for _, e in sorted(enumerate(links), key=lambda il: (il[1].get("multi_input_sort_id", 0), il[0])):
+        (from_name, from_id), (to_name, to_id) = e["from"], e["to"]
+        from_node = node_named(from_name, f"link {e['from']} -> {e['to']}")
+        to_node = node_named(to_name, f"link {e['from']} -> {e['to']}")
+        link = tree.links.new(socket(from_node, from_id, output=True), socket(to_node, to_id))
+        if e.get("muted"):
+            link.is_muted = True
+    return id_map
+
+obj_name, mod_name, tree_name = ARGS.get("object"), ARGS.get("modifier"), ARGS.get("tree")
+try:
+    if bool(obj_name) == bool(tree_name):
+        raise GNError("give exactly one of object or tree")
+    obj = mod = None
+    if obj_name:
+        obj = find_object(obj_name)
+        mods = gn_modifiers(obj)
+        if mod_name:
+            mod = next((m for m in mods if m.name == mod_name), None)
+        elif len(mods) == 1:
+            mod = mods[0]
+        elif mods:
+            raise GNError(f"{obj.name!r} has {len(mods)} Geometry Nodes modifiers, pass modifier=: "
+                          f"{[m.name for m in mods]}")
+        original = mod.node_group if mod else None
+    else:
+        original = bpy.data.node_groups.get(tree_name)
+    if original is not None:
+        check_gn_tree(original)
+    name = spec.get("name") or (original.name if original else tree_name or "Geometry Nodes")
+    work = original.copy() if original else bpy.data.node_groups.new(name, "GeometryNodeTree")
+    try:
+        id_map = build(work)
+    except BaseException:
+        bpy.data.node_groups.remove(work)
+        raise
+except GNError as e:
+    return {"error": str(e)}
+
+if original is not None:
+    original.user_remap(work)
+    bpy.data.node_groups.remove(original)
+work.name = name
+if "is_modifier" in spec:
+    work.is_modifier = spec["is_modifier"]
+elif original is None:
+    work.is_modifier = obj is not None
+if obj is not None:
+    if mod is None:
+        mod = obj.modifiers.new(mod_name or "GeometryNodes", "NODES")
+    if mod.node_group != work:
+        mod.node_group = work
+# Modifiers using the tree add properties for new interface inputs only when told.
+work.interface_update(bpy.context)
+
+result = {"tree": work.name, "nodes": len(work.nodes), "links": len(work.links),
+          "interface": [{"in_out": i.in_out, "name": i.name, "id": i.identifier}
+                        for i in work.interface.items_tree if i.item_type == "SOCKET"]}
+changed_ids = {old: new for old, new in id_map.items() if old != new}
+if changed_ids:
+    result["interface_id_changes"] = changed_ids
+invalid = [[l.from_node.name, l.from_socket.identifier, l.to_node.name, l.to_socket.identifier]
+           for l in work.links if not l.is_valid]
+if invalid:
+    result["invalid_links"] = invalid
+if obj is not None:
+    result["modifier"] = {"object": obj.name, "name": mod.name}
+return result
+'''
+
+
+# Changes values in place: node settings, unlinked node inputs, and the input
+# values on a Geometry Nodes modifier (a plain value, or {"attribute": name}).
+GN_SET_INPUTS = _GN_COMMON + r'''
+changed = []
+try:
+    tree, obj, mod = find_tree(ARGS)
+    for name, props in (ARGS.get("node_props") or {}).items():
+        node = find_node(tree, name)
+        for key, v in props.items():
+            set_node_prop(node, key, v)
+            changed.append(f"{name}.{key}")
+    for name, inputs in (ARGS.get("node_inputs") or {}).items():
+        node = find_node(tree, name)
+        for key, v in inputs.items():
+            socket = find_socket(node, key)
+            try:
+                set_socket_value(socket, v)
+            except (TypeError, ValueError, AttributeError) as e:
+                raise GNError(f"node {name!r}, input {key!r}: {e}")
+            changed.append(f"{name}.{socket.identifier}")
+    modifier_inputs = ARGS.get("modifier_inputs") or {}
+    if modifier_inputs and mod is None:
+        raise GNError("modifier_inputs need object=, the object whose modifier to change")
+    items = [i for i in tree.interface.items_tree if i.item_type == "SOCKET" and i.in_out == "INPUT"]
+    for key, v in modifier_inputs.items():
+        matches = [i for i in items if i.identifier == key] or [i for i in items if i.name == key]
+        if len(matches) != 1:
+            available = [f"{i.identifier} ({i.name})" for i in items]
+            raise GNError(f"{'ambiguous' if matches else 'no'} modifier input {key!r}; inputs: {available}")
+        item = matches[0]
+        ident = item.identifier
+        if ident not in mod.keys():
+            raise GNError(f"input {item.name!r} ({item.socket_type}) has no value on the modifier")
+        if isinstance(v, dict):
+            if set(v) != {"attribute"} or ident + "_use_attribute" not in mod.keys():
+                raise GNError(f"input {item.name!r}: a dict value must be {{\"attribute\": name}} on a field input")
+            mod[ident + "_use_attribute"] = True
+            mod[ident + "_attribute_name"] = v["attribute"]
+        else:
+            if ident + "_use_attribute" in mod.keys():
+                mod[ident + "_use_attribute"] = False
+            try:
+                mod[ident] = to_socket_value(item.socket_type, v)
+            except (TypeError, ValueError) as e:
+                raise GNError(f"modifier input {item.name!r}: {e}")
+        changed.append(f"modifier.{ident}")
+    if modifier_inputs:
+        # Setting modifier properties from Python doesn't re-evaluate the object by itself.
+        obj.update_tag()
+except GNError as e:
+    return {"error": str(e), "changed": changed}
+return {"changed": changed}
+'''
+
+
+# Node types a Geometry Nodes tree can hold in this Blender, or one type's
+# settings (with enum choices) and sockets. Sockets depend on mode-like
+# settings, so `props` are applied first. Works on a scratch tree it removes.
+GN_NODE_TYPES = _GN_COMMON + r'''
+probe = bpy.data.node_groups.new("__mcp_gn_probe__", "GeometryNodeTree")
+try:
+    node_type = ARGS.get("node_type")
+    if not node_type:
+        words = (ARGS.get("query") or "").lower().split()
+        found = []
+        for name in node_classes():
+            try:
+                node = probe.nodes.new(name)
+            except RuntimeError:
+                continue  # not a node type a Geometry Nodes tree can hold
+            label = node.bl_label
+            probe.nodes.remove(node)
+            if all(w in name.lower() or w in label.lower() for w in words):
+                found.append([name, label])
+        return {"blender": bpy.app.version_string, "count": len(found), "types": found}
+    try:
+        node = probe.nodes.new(node_type)
+    except RuntimeError:
+        guesses = [n for n in node_classes() if node_type.lower() in n.lower()]
+        return {"error": f"{node_type!r} is not a node type a Geometry Nodes tree can hold",
+                "did_you_mean": sorted(guesses)[:15]}
+    for key, v in (ARGS.get("props") or {}).items():
+        set_node_prop(node, key, v)
+    current = node_props(node)
+    settings = []
+    for prop in node.bl_rna.properties:
+        if prop.identifier not in current:
+            continue
+        entry = {"name": prop.identifier, "type": prop.type, "value": current[prop.identifier]}
+        if prop.type == "ENUM":
+            entry["items"] = [i.identifier for i in prop.enum_items]
+        settings.append(entry)
+
+    def sockets(socks):
+        out = []
+        for s in shown_sockets(socks):
+            entry = {"id": s.identifier, "name": s.name, "type": s.type}
+            if hasattr(s, "default_value") and not s.hide_value:
+                entry["default"] = value(s.default_value)
+            if s.is_multi_input:
+                entry["multi_input"] = True
+            out.append(entry)
+        return out
+
+    return {"type": node_type, "label": node.bl_label, "blender": bpy.app.version_string,
+            "settings": settings, "inputs": sockets(node.inputs), "outputs": sockets(node.outputs)}
+except GNError as e:
+    return {"error": str(e)}
+finally:
+    bpy.data.node_groups.remove(probe)
+'''
+
+
+# What an object's modifier stack produced: counts and attributes per geometry
+# component, instances by what they instance, and the world bounding box.
+GN_EVALUATED = _GN_COMMON + r'''
+if bpy.app.version < (4, 3, 0):
+    return {"error": f"needs Blender 4.3 or newer (Object.evaluated_geometry), this is {bpy.app.version_string}"}
+try:
+    obj = find_object(ARGS["object"])
+except GNError as e:
+    return {"error": str(e)}
+from mathutils import Vector
+
+def attributes(data):
+    # Dot-prefixed attributes are Blender's internal ones.
+    return [[a.name, a.domain, a.data_type] for a in data.attributes if not a.name.startswith(".")]
+
+def components(geo):
+    out = {}
+    if geo.mesh:
+        m = geo.mesh
+        out["mesh"] = {"vertices": len(m.vertices), "edges": len(m.edges), "faces": len(m.polygons),
+                       "corners": len(m.loops), "attributes": attributes(m),
+                       "materials": [s.name if s else None for s in m.materials]}
+    if geo.pointcloud:
+        out["pointcloud"] = {"points": len(geo.pointcloud.points), "attributes": attributes(geo.pointcloud)}
+    if geo.curves:
+        out["curves"] = {"curves": len(geo.curves.curves), "points": len(geo.curves.points),
+                         "attributes": attributes(geo.curves)}
+    if geo.volume:
+        out["volume"] = {"grids": len(geo.volume.grids)}
+    instances = geo.instances_pointcloud()
+    if instances:
+        refs = geo.instance_references()
+        index = [0] * len(instances.points)
+        instances.attributes[".reference_index"].data.foreach_get("value", index)
+        counts = [0] * len(refs)
+        for i in index:
+            counts[i] += 1
+        listed = []
+        for ref, count in list(zip(refs, counts))[:20]:
+            if isinstance(ref, bpy.types.ID):
+                what = {"type": type(ref).__name__, "name": ref.name}
+            else:
+                what = {"type": "geometry", "name": ref.name, "contents": components(ref)}
+            listed.append({"count": count, **what})
+        out["instances"] = {"count": len(instances.points), "references": listed,
+                            "attributes": attributes(instances)}
+        if len(refs) > 20:
+            out["instances"]["more_references"] = len(refs) - 20
+    return out
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+result = {"object": obj.name, "type": obj.type, **components(evaluated.evaluated_geometry())}
+# The object's own bound_box leaves instances out, so take every depsgraph
+# instance the object produced (its realized geometry is one of them too).
+corners = []
+for inst in depsgraph.object_instances:
+    owner = inst.parent if inst.is_instance else inst.object
+    if owner is not None and owner.original == obj:
+        corners.extend(inst.matrix_world @ Vector(c) for c in inst.object.bound_box)
+if corners:
+    lo = [round(min(c[i] for c in corners), 3) for i in range(3)]
+    hi = [round(max(c[i] for c in corners), 3) for i in range(3)]
+    result["world_bounding_box"] = [lo, hi]
+    result["size"] = [round(hi[i] - lo[i], 3) for i in range(3)]
 return result
 '''
