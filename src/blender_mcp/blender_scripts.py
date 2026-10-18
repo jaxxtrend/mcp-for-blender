@@ -1649,3 +1649,69 @@ finally:
         m.show_viewport = True
     bpy.data.node_groups.remove(probe)
 '''
+
+
+# Arranges a tree's nodes left to right along the data flow: each node's column
+# is its longest path to the end of the tree, and within a column nodes follow
+# the height of the nodes they feed. Node sizes are estimated, since Blender
+# only knows them once a node editor has drawn them. Frames are left alone.
+GN_LAYOUT = _GN_COMMON + r'''
+try:
+    tree, obj, mod = find_tree(ARGS)
+except GNError as e:
+    return {"error": str(e)}
+gap_x, gap_y = ARGS.get("spacing") or [60, 30]
+nodes = [n for n in tree.nodes if n.bl_idname != "NodeFrame"]
+feeds = {n.name: set() for n in nodes}
+for link in tree.links:
+    if link.from_node.name in feeds and link.to_node.name in feeds:
+        feeds[link.from_node.name].add(link.to_node.name)
+linked = {n for n, targets in feeds.items() if targets} | {t for targets in feeds.values() for t in targets}
+
+columns = {}
+def column(name):
+    if name not in columns:
+        columns[name] = 0  # zones make no cycles; this only guards against looping forever
+        columns[name] = 1 + max((column(t) for t in feeds[name]), default=-1)
+    return columns[name]
+for n in nodes:
+    column(n.name)
+last = max(columns.values(), default=0)
+for n in nodes:
+    if n.name not in linked:
+        columns[n.name] = last + 1  # unconnected nodes go to the far left
+
+def height(node):
+    if node.hide:
+        return 32
+    rows = len(shown_sockets(node.inputs)) + len(shown_sockets(node.outputs))
+    settings = sum(1 for p in node.bl_rna.properties if p.identifier not in BASE_NODE_PROPS
+                   and not p.is_readonly and p.type in {"ENUM", "BOOLEAN"})
+    return 44 + 22 * rows + 26 * settings
+
+by_column = {}
+for n in nodes:
+    by_column.setdefault(columns[n.name], []).append(n)
+placed, x = {}, 0.0
+for c in sorted(by_column):
+    members = by_column[c]
+    width = max(n.width for n in members)
+    if c:
+        x -= width + gap_x
+    def target_y(n):
+        ys = [placed[t] for t in feeds[n.name] if t in placed]
+        return sum(ys) / len(ys) if ys else n.location.y
+    members.sort(key=target_y, reverse=True)
+    total = sum(height(n) for n in members) + gap_y * (len(members) - 1)
+    centre = sum(target_y(n) for n in members) / len(members) if c else 0.0
+    y = centre + total / 2
+    for n in members:
+        location = (x, y)
+        if hasattr(n, "location_absolute"):
+            n.location_absolute = location
+        else:
+            n.location = location
+        placed[n.name] = y - height(n) / 2
+        y -= height(n) + gap_y
+return {"tree": tree.name, "nodes": len(nodes), "columns": len(by_column)}
+'''

@@ -196,3 +196,16 @@ def test_patch_applies_ops_in_order_or_not_at_all():
     assert reply["error"] == "op 1 (rename): 'Scatter' already has a node named 'Join Geometry'"
     assert get(object="Ground") == before
     assert sorted(g.name for g in bpy.data.node_groups) == ["Scatter"]
+
+
+def test_layout_runs_left_to_right_without_overlaps():
+    scatter_scene()
+    tree = bpy.data.node_groups["Scatter"]
+    assert run(blender_scripts.GN_LAYOUT, tree="Scatter")["tree"] == "Scatter"
+    x = {n.name: n.location_absolute.x for n in tree.nodes}
+    assert x["Group Input"] < x["Distribute Points on Faces"] < x["Instance on Points"] < x["Join Geometry"] < x["Group Output"]
+    by_column = {}
+    for n in tree.nodes:
+        by_column.setdefault(round(n.location_absolute.x), []).append(n.location_absolute.y)
+    for ys in by_column.values():
+        assert len(set(ys)) == len(ys)

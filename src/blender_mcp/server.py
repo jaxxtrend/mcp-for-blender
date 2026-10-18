@@ -831,6 +831,32 @@ async def gn_patch_tree(
 
 
 @mcp.tool()
+async def gn_layout_tree(
+    ctx: Context,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    spacing: list[float] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Arrange a Geometry Nodes tree's nodes so a person can read it: columns left to right along
+    the data flow, ending at the Group Output, with nodes lined up with what they feed and
+    unconnected nodes at the far left. Run it after building or patching a tree. Node sizes are
+    estimated, so spacing may be a little loose or tight. Give exactly one of object or tree.
+
+    Parameters:
+    - object / modifier / tree: Which tree, as in gn_get_tree.
+    - spacing: [horizontal, vertical] gap between nodes (default [60, 30]).
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    return _gn_reply(blender_scripts.GN_LAYOUT, {"object": object, "modifier": modifier, "tree": tree,
+                                                 "spacing": spacing}, "arranging nodes", read_only=False)
+
+
+@mcp.tool()
 async def gn_set_inputs(
     ctx: Context,
     object: str | None = None,
