@@ -549,3 +549,189 @@ for name in ARGS["names"]:
                 "size": [round(hi[i] - lo[i], 3) for i in range(3)]})
 return out
 '''
+
+
+# A Geometry Nodes tree as JSON: interface, nodes with their settings and the
+# values of unlinked inputs, and links by socket identifier. Given an object it
+# also reports the values set on the modifier. Hidden (disabled) sockets are left
+# out, since the node's current mode doesn't use them.
+GN_TREE = r'''
+import bpy
+import mathutils
+
+if bpy.app.version < (4, 0, 0):
+    return {"error": f"Blender {bpy.app.version_string} is not supported: needs 4.0 or newer"}
+
+def value(v):
+    if isinstance(v, bpy.types.ID):
+        return v.name
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return round(v, 4)
+    if isinstance(v, mathutils.Matrix):
+        return [[round(x, 4) for x in row] for row in v]
+    return [value(x) for x in v]
+
+def color_ramp(ramp):
+    return {"interpolation": ramp.interpolation, "color_mode": ramp.color_mode,
+            "elements": [[round(e.position, 4), value(e.color)] for e in ramp.elements]}
+
+def simple_props(struct, skip=()):
+    out = {}
+    for prop in struct.bl_rna.properties:
+        key = prop.identifier
+        if key in skip or key == "rna_type" or prop.type in {"POINTER", "COLLECTION"} or prop.is_readonly:
+            continue
+        out[key] = value(getattr(struct, key))
+    return out
+
+# Base node properties, plus which list item is selected in the sidebar: UI state, not part of the tree.
+BASE_NODE_PROPS = set(bpy.types.Node.bl_rna.properties.keys()) | {"active_index", "active_item", "inspection_index"}
+
+def node_props(node):
+    out = simple_props(node, BASE_NODE_PROPS)
+    for prop in node.bl_rna.properties:
+        key = prop.identifier
+        if key in BASE_NODE_PROPS:
+            continue
+        if prop.type == "POINTER":
+            v = getattr(node, key)
+            if v is None or isinstance(v, (bpy.types.ID, bpy.types.Node)):
+                out[key] = None if v is None else v.name
+            elif isinstance(v, bpy.types.ColorRamp):
+                out[key] = color_ramp(v)
+            elif isinstance(v, bpy.types.CurveMapping):
+                out[key] = {"curves": [[[round(p.location.x, 4), round(p.location.y, 4)] for p in c.points]
+                                       for c in v.curves]}
+            else:
+                out[key] = f"({type(v).__name__}, not shown)"
+        elif prop.type == "COLLECTION":
+            out[key] = [simple_props(item) for item in getattr(node, key)]
+    return out
+
+def socket_entry(socket, with_value):
+    entry = {"id": socket.identifier}
+    if socket.name != socket.identifier:
+        entry["name"] = socket.name
+    if with_value and not socket.is_linked and not socket.hide_value and hasattr(socket, "default_value"):
+        entry["value"] = value(socket.default_value)
+    return entry
+
+def interface(tree):
+    items = []
+    for item in tree.interface.items_tree:
+        parent = item.parent.name if item.parent and item.parent.parent else None
+        if item.item_type == "PANEL":
+            entry = {"panel": item.name}
+        else:
+            entry = {"in_out": item.in_out, "name": item.name, "id": item.identifier,
+                     "type": item.socket_type}
+            for key in ("default_value", "min_value", "max_value"):
+                # min/max at the float limits just mean "no limit".
+                if hasattr(item, key) and not (key != "default_value" and abs(getattr(item, key)) > 1e30):
+                    entry[key.replace("_value", "")] = value(getattr(item, key))
+            if getattr(item, "default_input", "VALUE") != "VALUE":
+                entry["default_input"] = item.default_input
+        if parent:
+            entry["in_panel"] = parent
+        items.append(entry)
+    return items
+
+def dump_tree(tree):
+    nodes = []
+    for node in tree.nodes:
+        entry = {"name": node.name, "type": node.bl_idname,
+                 "location": [round(node.location.x), round(node.location.y)]}
+        if node.label:
+            entry["label"] = node.label
+        if node.parent:
+            entry["parent"] = node.parent.name
+        if node.mute:
+            entry["mute"] = True
+        props = node_props(node)
+        if props:
+            entry["props"] = props
+        # NodeSocketVirtual is the empty "add a socket" slot on group input/output nodes.
+        inputs = [socket_entry(s, True) for s in node.inputs if s.enabled and s.bl_idname != "NodeSocketVirtual"]
+        inputs = [s for s in inputs if len(s) > 1]
+        if inputs:
+            entry["inputs"] = inputs
+        outputs = [socket_entry(s, False) for s in node.outputs if s.enabled and s.bl_idname != "NodeSocketVirtual"]
+        outputs = [s for s in outputs if len(s) > 1]
+        if outputs:
+            entry["outputs"] = outputs
+        nodes.append(entry)
+    links = []
+    for link in tree.links:
+        entry = {"from": [link.from_node.name, link.from_socket.identifier],
+                 "to": [link.to_node.name, link.to_socket.identifier]}
+        if link.to_socket.is_multi_input:
+            entry["multi_input_sort_id"] = link.multi_input_sort_id
+        if not link.is_valid:
+            entry["invalid"] = True
+        if link.is_muted:
+            entry["muted"] = True
+        links.append(entry)
+    groups = sorted({n.node_tree.name for n in tree.nodes
+                     if n.bl_idname == "GeometryNodeGroup" and n.node_tree})
+    out = {"name": tree.name, "is_modifier": tree.is_modifier, "interface": interface(tree),
+           "nodes": nodes, "links": links}
+    if tree.description:
+        out["description"] = tree.description
+    if groups:
+        out["uses_groups"] = groups
+    return out
+
+obj_name, mod_name, tree_name = ARGS.get("object"), ARGS.get("modifier"), ARGS.get("tree")
+if bool(obj_name) == bool(tree_name):
+    return {"error": "give exactly one of object or tree"}
+
+result = {}
+if obj_name:
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
+        return {"error": f"no object named {obj_name!r}"}
+    gn_mods = [m for m in obj.modifiers if m.type == "NODES"]
+    if mod_name:
+        mod = next((m for m in gn_mods if m.name == mod_name), None)
+        if mod is None:
+            return {"error": f"{obj.name!r} has no Geometry Nodes modifier {mod_name!r}; "
+                             f"it has: {[m.name for m in gn_mods]}"}
+    elif len(gn_mods) == 1:
+        mod = gn_mods[0]
+    else:
+        return {"error": f"{obj.name!r} has {len(gn_mods)} Geometry Nodes modifiers, pass modifier=: "
+                         f"{[m.name for m in gn_mods]}"}
+    if mod.node_group is None:
+        return {"error": f"modifier {mod.name!r} on {obj.name!r} has no node group"}
+    tree = mod.node_group
+    inputs = {}
+    for item in tree.interface.items_tree:
+        if item.item_type != "SOCKET" or item.in_out != "INPUT" or item.identifier not in mod.keys():
+            continue
+        entry = {"name": item.name, "value": value(mod[item.identifier])}
+        if mod.get(item.identifier + "_use_attribute"):
+            entry["attribute"] = mod[item.identifier + "_attribute_name"]
+        inputs[item.identifier] = entry
+    result["modifier"] = {"object": obj.name, "name": mod.name, "inputs": inputs}
+else:
+    tree = bpy.data.node_groups.get(tree_name)
+    if tree is None:
+        return {"error": f"no node group named {tree_name!r}"}
+
+if tree.bl_idname != "GeometryNodeTree":
+    return {"error": f"{tree.name!r} is a {tree.bl_idname}, not a Geometry Nodes tree"}
+
+result["tree"] = dump_tree(tree)
+if ARGS.get("include_nested"):
+    nested, queue = {}, list(result["tree"].get("uses_groups", []))
+    while queue:
+        name = queue.pop(0)
+        if name in nested or name == tree.name:
+            continue
+        nested[name] = dump_tree(bpy.data.node_groups[name])
+        queue.extend(nested[name].get("uses_groups", []))
+    result["nested"] = list(nested.values())
+return result
+'''

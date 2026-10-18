@@ -3,6 +3,7 @@ through execute_code."""
 
 import ast
 import asyncio
+import json
 
 from blender_mcp import blender_scripts, guides, server
 from blender_mcp.openai_apps import is_app_only
@@ -10,6 +11,7 @@ from blender_mcp.openai_apps import is_app_only
 MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
+    "gn_get_tree",
 }
 
 
@@ -33,7 +35,8 @@ def test_guides_are_off_for_now():
 
 def test_scripts_compile_and_never_raise_systemexit():
     # The addon catches Exception around execute_code but not SystemExit.
-    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS):
+    for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS,
+                   blender_scripts.GN_TREE):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code
@@ -99,6 +102,28 @@ def test_scene_info_sends_only_the_requested_fields(monkeypatch):
     assert sent[-1]["fields"] == ["materials"]
     reply = asyncio.run(server.get_scene_info(None, fields=["colour"]))
     assert reply.startswith("Error") and "materials" in reply
+
+
+def test_gn_get_tree_needs_exactly_one_target(monkeypatch):
+    monkeypatch.setattr(server, "_run_script", lambda *a: (_ for _ in ()).throw(AssertionError("ran")))
+    assert asyncio.run(server.gn_get_tree(None)).startswith("Error")
+    assert asyncio.run(server.gn_get_tree(None, object="Cube", tree="Group")).startswith("Error")
+
+
+def test_gn_get_tree_passes_the_target_and_reports_script_errors(monkeypatch):
+    sent = []
+
+    def fake_run(script, args):
+        sent.append(args)
+        if args["tree"] == "Missing":
+            return {"error": "no node group named 'Missing'"}
+        return {"tree": {"name": "Scatter", "nodes": [], "links": []}}
+
+    monkeypatch.setattr(server, "_run_script", fake_run)
+    reply = asyncio.run(server.gn_get_tree(None, object="Ground", modifier="GN"))
+    assert sent[-1] == {"object": "Ground", "modifier": "GN", "tree": None, "include_nested": False}
+    assert json.loads(reply)["tree"]["name"] == "Scatter"
+    assert asyncio.run(server.gn_get_tree(None, tree="Missing")) == "Error: no node group named 'Missing'"
 
 
 class _Blender:

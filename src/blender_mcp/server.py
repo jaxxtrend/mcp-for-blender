@@ -679,6 +679,51 @@ async def get_scene_info(
             pass
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_get_tree(
+    ctx: Context,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    include_nested: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read a Geometry Nodes tree as JSON: its interface, nodes and links. Read it before changing a
+    tree, and again after, to check what you built.
+
+    Give exactly one of object or tree. With object, the tree comes from that object's Geometry
+    Nodes modifier, and "modifier" lists the input values set on the modifier (by interface id).
+
+    The result:
+    - tree.interface: group sockets and panels, with id, type, default and min/max.
+    - tree.nodes: name, type (bl_idname), location, frame parent, props (node settings such as
+      operation or data_type, zone items, color ramp and curve points), inputs and outputs.
+      Inputs list the value of each unlinked input. A socket shows "name" only when it differs
+      from its id. Disabled sockets (unused by the node's current mode) are left out.
+    - tree.links: {"from": [node, socket id], "to": [node, socket id]}.
+    - tree.uses_groups: node groups used inside; include_nested=True adds them under "nested".
+
+    Parameters:
+    - object: Object with a Geometry Nodes modifier.
+    - modifier: Modifier name, needed only when the object has more than one.
+    - tree: Node group name, to read a group directly.
+    - include_nested: Also read every node group used inside, recursively.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    try:
+        data = _run_script(blender_scripts.GN_TREE, {
+            "object": object, "modifier": modifier, "tree": tree, "include_nested": include_nested})
+    except Exception as e:
+        logger.error(f"Error reading node tree: {e}")
+        return f"Error reading node tree: {e}"
+    if data.get("error"):
+        return f"Error: {data['error']}"
+    return json.dumps(data, separators=(",", ":"))
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 
