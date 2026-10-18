@@ -150,3 +150,30 @@ def test_node_types():
     assert {s["type"] for s in compare["inputs"] if s["name"] == "A"} == {"VECTOR"}
     assert "error" in run(blender_scripts.GN_NODE_TYPES, node_type="GeometryNodeNope")
     assert "__mcp_gn_probe__" not in bpy.data.node_groups
+
+
+def test_probe_measures_a_socket_without_changing_the_tree():
+    ground, _ = scatter_scene()
+    before = get(object="Ground")
+    points = run(blender_scripts.GN_PROBE, object="Ground", node="Distribute Points on Faces", socket="Points")
+    assert points["socket_type"] == "GEOMETRY" and points["pointcloud"]["points"] == 400
+    tree = bpy.data.node_groups["Scatter"]
+    index = tree.nodes.new("GeometryNodeInputIndex")
+    index.name = "Index"
+    capture = tree.nodes.new("GeometryNodeSetID")
+    tree.links.new(tree.nodes["Distribute Points on Faces"].outputs["Points"], capture.inputs["Geometry"])
+    tree.links.new(index.outputs["Index"], capture.inputs["ID"])
+    before = get(object="Ground")
+    field = run(blender_scripts.GN_PROBE, object="Ground", node="Index", socket="Index", sample=3)
+    assert field["evaluated_on"] == ["Distribute Points on Faces", "Points"]
+    assert field["components"]["pointcloud"]["sample"] == [0, 1, 2]
+    assert field["components"]["pointcloud"]["max"] == 399
+    assert get(object="Ground") == before
+    assert sorted(g.name for g in bpy.data.node_groups) == ["Scatter"]
+
+
+def test_read_attribute():
+    scatter_scene()
+    position = run(blender_scripts.GN_READ_ATTRIBUTE, object="Ground", name="position")["components"]
+    assert position["mesh"]["count"] == 4 and position["mesh"]["min"] == [-2.0, -2.0, 0.0]
+    assert "no attribute 'nope'" in run(blender_scripts.GN_READ_ATTRIBUTE, object="Ground", name="nope")["error"]

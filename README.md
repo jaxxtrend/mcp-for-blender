@@ -643,6 +643,8 @@ The AI writes Blender Python itself for modelling, layout, materials, animation,
 | `gn_set_inputs` | Change modifier inputs (values or attributes), node input values and node settings in place |
 | `gn_list_node_types` | Node types this Blender version has, or one type's settings and sockets for a given mode |
 | `gn_get_evaluated_info` | What the modifiers produced: counts, attributes, instances and the bounding box (Blender 4.3+) |
+| `gn_probe_socket` | Measure what any node output produces, like a Viewer node: geometry contents, or a field's values on the geometry it feeds (Blender 4.3+) |
+| `gn_read_attribute` | One attribute's values like the Spreadsheet: min/max/mean, distinct values, a sample (Blender 4.3+) |
 | `disable_telemetry`, `record_trajectory_feedback` | Data collection controls |
 
 #### Hunyuan3D on Tencent Cloud (Official API mode)

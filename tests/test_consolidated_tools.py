@@ -12,6 +12,7 @@ MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
     "gn_get_tree", "gn_build_tree", "gn_set_inputs", "gn_list_node_types", "gn_get_evaluated_info",
+    "gn_probe_socket", "gn_read_attribute",
 }
 
 
@@ -37,7 +38,8 @@ def test_scripts_compile_and_never_raise_systemexit():
     # The addon catches Exception around execute_code but not SystemExit.
     for script in (blender_scripts.SCENE_SUMMARY, blender_scripts.LOOK, blender_scripts.BOUNDS,
                    blender_scripts.GN_TREE, blender_scripts.GN_BUILD, blender_scripts.GN_SET_INPUTS,
-                   blender_scripts.GN_NODE_TYPES, blender_scripts.GN_EVALUATED):
+                   blender_scripts.GN_NODE_TYPES, blender_scripts.GN_EVALUATED, blender_scripts.GN_PROBE,
+                   blender_scripts.GN_READ_ATTRIBUTE):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code
@@ -140,7 +142,9 @@ def test_gn_tools_mark_only_edits_as_edits(monkeypatch):
     asyncio.run(server.gn_set_inputs(None, tree="T", node_props={"Math": {"operation": "ADD"}}))
     asyncio.run(server.gn_list_node_types(None))
     asyncio.run(server.gn_get_evaluated_info(None, object="Cube"))
-    assert calls == {blender_scripts.GN_TREE: True, blender_scripts.GN_BUILD: False,
+    asyncio.run(server.gn_probe_socket(None, object="Cube", node="Math", socket="Value"))
+    asyncio.run(server.gn_read_attribute(None, object="Cube", name="position"))
+    assert calls == {blender_scripts.GN_PROBE: True, blender_scripts.GN_READ_ATTRIBUTE: True, blender_scripts.GN_TREE: True, blender_scripts.GN_BUILD: False,
                      blender_scripts.GN_SET_INPUTS: False, blender_scripts.GN_NODE_TYPES: True,
                      blender_scripts.GN_EVALUATED: True}
 

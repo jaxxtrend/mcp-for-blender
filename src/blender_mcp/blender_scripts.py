@@ -1229,70 +1229,253 @@ finally:
 '''
 
 
-# What an object's modifier stack produced: counts and attributes per geometry
-# component, instances by what they instance, and the world bounding box.
-GN_EVALUATED = _GN_COMMON + r'''
+# Shared by the scripts that read evaluated geometry (Blender 4.3+, where
+# Object.evaluated_geometry exists): what each component holds, attribute
+# statistics, and the world bounding box including instances.
+_GN_GEOMETRY = r'''
 if bpy.app.version < (4, 3, 0):
     return {"error": f"needs Blender 4.3 or newer (Object.evaluated_geometry), this is {bpy.app.version_string}"}
-try:
-    obj = find_object(ARGS["object"])
-except GNError as e:
-    return {"error": str(e)}
+import numpy as np
 from mathutils import Vector
 
-def attributes(data):
+# Attribute data type -> (foreach_get key, values per element, buffer dtype).
+ATTRIBUTE_LAYOUT = {
+    "FLOAT": ("value", 1, np.float32), "INT": ("value", 1, np.int32), "BOOLEAN": ("value", 1, np.bool_),
+    "INT8": ("value", 1, np.int32), "INT16_2D": ("value", 2, np.int32), "INT32_2D": ("value", 2, np.int32),
+    "FLOAT2": ("vector", 2, np.float32), "FLOAT_VECTOR": ("vector", 3, np.float32),
+    "FLOAT_COLOR": ("color", 4, np.float32), "BYTE_COLOR": ("color", 4, np.float32),
+    "QUATERNION": ("value", 4, np.float32), "FLOAT4X4": ("value", 16, np.float32),
+}
+
+def geometry_parts(geo):
+    """(component name, data) for each non-empty component; instances as their point cloud."""
+    parts = [("mesh", geo.mesh), ("pointcloud", geo.pointcloud), ("curves", geo.curves)]
+    parts.append(("instances", geo.instances_pointcloud()))
+    return [(name, data) for name, data in parts if data]
+
+def attribute_list(data):
     # Dot-prefixed attributes are Blender's internal ones.
     return [[a.name, a.domain, a.data_type] for a in data.attributes if not a.name.startswith(".")]
+
+def attribute_values(attr):
+    """An (elements, channels) array, or a list of strings for STRING attributes."""
+    if attr.data_type == "STRING":
+        # String attributes hold bytes.
+        return [d.value.decode("utf-8", "replace") for d in attr.data]
+    if attr.data_type not in ATTRIBUTE_LAYOUT:
+        raise GNError(f"can't read {attr.data_type} attribute {attr.name!r}")
+    key, width, dtype = ATTRIBUTE_LAYOUT[attr.data_type]
+    buf = np.empty(len(attr.data) * width, dtype=dtype)
+    attr.data.foreach_get(key, buf)
+    return buf.reshape(len(attr.data), width)
+
+def attribute_stats(attr, sample=10):
+    values = attribute_values(attr)
+    out = {"name": attr.name, "domain": attr.domain, "data_type": attr.data_type, "count": len(values)}
+    if isinstance(values, list):
+        distinct = sorted(set(values))
+        out["distinct"] = len(distinct)
+        out["sample"] = values[:sample]
+        return out
+    out["sample"] = [value(row[0].item()) if values.shape[1] == 1 else [value(x.item()) for x in row]
+                     for row in values[:sample]]
+    if not len(values):
+        return out
+    if values.dtype == np.bool_:
+        out["true"] = int(values.sum())
+        return out
+    finite = np.isfinite(values) if values.dtype.kind == "f" else np.ones(values.shape, dtype=bool)
+    if not finite.all():
+        out["non_finite"] = int((~finite).any(axis=1).sum())
+    clean = values[finite.all(axis=1)]
+    if len(clean):
+        single = values.shape[1] == 1
+        for stat, fn in (("min", np.min), ("max", np.max), ("mean", np.mean)):
+            got = [int(x) if stat != "mean" and values.dtype.kind == "i" else round(float(x), 4)
+                   for x in fn(clean, axis=0)]
+            out[stat] = got[0] if single else got
+    if values.dtype.kind == "i" and values.shape[1] == 1:
+        distinct, counts = np.unique(values, return_counts=True)
+        out["distinct"] = len(distinct)
+        if len(distinct) <= 20:
+            out["counts"] = {str(int(v)): int(c) for v, c in zip(distinct, counts)}
+    return out
 
 def components(geo):
     out = {}
     if geo.mesh:
         m = geo.mesh
         out["mesh"] = {"vertices": len(m.vertices), "edges": len(m.edges), "faces": len(m.polygons),
-                       "corners": len(m.loops), "attributes": attributes(m),
+                       "corners": len(m.loops), "attributes": attribute_list(m),
                        "materials": [s.name if s else None for s in m.materials]}
     if geo.pointcloud:
-        out["pointcloud"] = {"points": len(geo.pointcloud.points), "attributes": attributes(geo.pointcloud)}
+        out["pointcloud"] = {"points": len(geo.pointcloud.points), "attributes": attribute_list(geo.pointcloud)}
     if geo.curves:
         out["curves"] = {"curves": len(geo.curves.curves), "points": len(geo.curves.points),
-                         "attributes": attributes(geo.curves)}
+                         "attributes": attribute_list(geo.curves)}
     if geo.volume:
         out["volume"] = {"grids": len(geo.volume.grids)}
     instances = geo.instances_pointcloud()
     if instances:
         refs = geo.instance_references()
-        index = [0] * len(instances.points)
+        index = np.empty(len(instances.points), dtype=np.int32)
         instances.attributes[".reference_index"].data.foreach_get("value", index)
-        counts = [0] * len(refs)
-        for i in index:
-            counts[i] += 1
+        counts = np.bincount(index, minlength=len(refs))
         listed = []
         for ref, count in list(zip(refs, counts))[:20]:
             if isinstance(ref, bpy.types.ID):
                 what = {"type": type(ref).__name__, "name": ref.name}
             else:
                 what = {"type": "geometry", "name": ref.name, "contents": components(ref)}
-            listed.append({"count": count, **what})
+            listed.append({"count": int(count), **what})
         out["instances"] = {"count": len(instances.points), "references": listed,
-                            "attributes": attributes(instances)}
+                            "attributes": attribute_list(instances)}
         if len(refs) > 20:
             out["instances"]["more_references"] = len(refs) - 20
     return out
 
-depsgraph = bpy.context.evaluated_depsgraph_get()
-evaluated = obj.evaluated_get(depsgraph)
-result = {"object": obj.name, "type": obj.type, **components(evaluated.evaluated_geometry())}
-# The object's own bound_box leaves instances out, so take every depsgraph
-# instance the object produced (its realized geometry is one of them too).
-corners = []
-for inst in depsgraph.object_instances:
-    owner = inst.parent if inst.is_instance else inst.object
-    if owner is not None and owner.original == obj:
-        corners.extend(inst.matrix_world @ Vector(c) for c in inst.object.bound_box)
-if corners:
+def world_bounds(obj, depsgraph):
+    """World bounding box of everything the object produced. Its own bound_box
+    leaves instances out, so this takes every depsgraph instance it made (its
+    realized geometry is one of them too)."""
+    corners = []
+    for inst in depsgraph.object_instances:
+        owner = inst.parent if inst.is_instance else inst.object
+        if owner is not None and owner.original == obj:
+            corners.extend(inst.matrix_world @ Vector(c) for c in inst.object.bound_box)
+    if not corners:
+        return {}
     lo = [round(min(c[i] for c in corners), 3) for i in range(3)]
     hi = [round(max(c[i] for c in corners), 3) for i in range(3)]
-    result["world_bounding_box"] = [lo, hi]
-    result["size"] = [round(hi[i] - lo[i], 3) for i in range(3)]
-return result
+    return {"world_bounding_box": [lo, hi], "size": [round(hi[i] - lo[i], 3) for i in range(3)]}
+
+def find_attribute(geo, name, component=None):
+    """[(component name, attribute)] for every component holding the attribute."""
+    found = []
+    for part, data in geometry_parts(geo):
+        if component and part != component:
+            continue
+        attr = data.attributes.get(name)
+        if attr is not None:
+            found.append((part, attr))
+    return found
+'''
+
+
+# What an object's modifier stack produced: counts and attributes per geometry
+# component, instances by what they instance, and the world bounding box.
+GN_EVALUATED = _GN_COMMON + _GN_GEOMETRY + r'''
+try:
+    obj = find_object(ARGS["object"])
+except GNError as e:
+    return {"error": str(e)}
+depsgraph = bpy.context.evaluated_depsgraph_get()
+evaluated = obj.evaluated_get(depsgraph)
+return {"object": obj.name, "type": obj.type, **components(evaluated.evaluated_geometry()),
+        **world_bounds(obj, depsgraph)}
+'''
+
+
+# Values of one attribute on an object's evaluated geometry, like the
+# Spreadsheet: count, min/max/mean per channel, distinct values, a sample.
+GN_READ_ATTRIBUTE = _GN_COMMON + _GN_GEOMETRY + r'''
+try:
+    obj = find_object(ARGS["object"])
+    geo = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).evaluated_geometry()
+    found = find_attribute(geo, ARGS["name"], ARGS.get("component"))
+    if not found:
+        available = {part: [a[0] for a in attribute_list(data)] for part, data in geometry_parts(geo)}
+        raise GNError(f"no attribute {ARGS['name']!r} on {obj.name!r}"
+                      + (f" in {ARGS['component']}" if ARGS.get("component") else "") + f"; it has: {available}")
+    sample = max(0, min(int(ARGS.get("sample", 10)), 100))
+    return {"object": obj.name, "components": {part: attribute_stats(attr, sample) for part, attr in found}}
+except GNError as e:
+    return {"error": str(e)}
+'''
+
+
+# What one node output produces in the context of an object's modifier. The
+# probe runs on a copy of the tree, wired so the socket feeds the group output,
+# which the modifier uses only while it is measured; the user's tree is never
+# changed. A geometry output is measured as geometry. A field is stored as an
+# attribute on the geometry it is evaluated on (the geometry input of the node it
+# feeds, or `context`) and its values are summarized.
+GN_PROBE = _GN_COMMON + _GN_GEOMETRY + r'''
+STORE_TYPES = {"VALUE": "FLOAT", "INT": "INT", "BOOLEAN": "BOOLEAN", "VECTOR": "FLOAT_VECTOR",
+               "RGBA": "FLOAT_COLOR", "ROTATION": "QUATERNION", "MATRIX": "FLOAT4X4"}
+PROBE_NAME = "__mcp_probe__"
+
+def field_context(probe, socket, context):
+    """The geometry socket a field is evaluated on."""
+    if context:
+        return find_socket(find_node(probe, context[0]), context[1], output=True)
+    for link in socket.links:
+        for target in link.to_node.inputs:
+            if target.type == "GEOMETRY" and target.is_linked:
+                return target.links[0].from_socket
+    raise GNError(f"can't tell which geometry {socket.node.name!r} {socket.identifier!r} is evaluated on: "
+                  "it feeds no node with a linked geometry input. Pass context=[node, geometry output].")
+
+try:
+    if not ARGS.get("object"):
+        raise GNError("needs object=: a probe measures the tree on that object's modifier")
+    tree, obj, mod = find_tree(ARGS)
+    node = find_node(tree, ARGS["node"])
+    socket_id = find_socket(node, ARGS["socket"], output=True).identifier
+except GNError as e:
+    return {"error": str(e)}
+
+probe = tree.copy()
+later = [m for m in obj.modifiers[list(obj.modifiers).index(mod) + 1:] if m.show_viewport]
+try:
+    socket = find_socket(probe.nodes[node.name], socket_id, output=True)
+    outputs = [n for n in probe.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output]
+    geometry_out = next((s for n in outputs for s in n.inputs if s.type == "GEOMETRY"), None)
+    if geometry_out is None:
+        raise GNError(f"{tree.name!r} has no geometry output to measure through")
+    if socket.type == "GEOMETRY":
+        source, field = socket, None
+    else:
+        if socket.type not in STORE_TYPES:
+            raise GNError(f"can't measure a {socket.type} socket")
+        store = probe.nodes.new("GeometryNodeStoreNamedAttribute")
+        store.data_type = STORE_TYPES[socket.type]
+        store.domain = ARGS.get("domain") or "POINT"
+        store.inputs["Name"].default_value = PROBE_NAME
+        probe.links.new(field_context(probe, socket, ARGS.get("context")), store.inputs["Geometry"])
+        probe.links.new(socket, store.inputs["Value"])
+        source, field = store.outputs["Geometry"], store
+    probe.links.new(source, geometry_out)
+    # Measure this modifier's output, not what later modifiers make of it.
+    for m in later:
+        m.show_viewport = False
+    mod.node_group = probe
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    geo = obj.evaluated_get(depsgraph).evaluated_geometry()
+    result = {"node": node.name, "socket": socket_id, "socket_type": socket.type}
+    if field is None:
+        result.update(components(geo))
+        result.update(world_bounds(obj, depsgraph))
+    else:
+        found = find_attribute(geo, PROBE_NAME)
+        if not found:
+            raise GNError(f"the field produced no values on the {field.domain} domain of that geometry")
+        sample = max(0, min(int(ARGS.get("sample", 10)), 100))
+        result["domain"] = field.domain
+        result["evaluated_on"] = [field.inputs["Geometry"].links[0].from_node.name,
+                                  field.inputs["Geometry"].links[0].from_socket.identifier]
+        result["components"] = {}
+        for part, attr in found:
+            stats = attribute_stats(attr, sample)
+            for key in ("name", "domain"):
+                stats.pop(key)
+            result["components"][part] = stats
+    return result
+except GNError as e:
+    return {"error": str(e)}
+finally:
+    mod.node_group = tree
+    for m in later:
+        m.show_viewport = True
+    bpy.data.node_groups.remove(probe)
 '''

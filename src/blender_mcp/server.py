@@ -864,6 +864,71 @@ async def gn_get_evaluated_info(ctx: Context, object: str, user_prompt: str = ""
     return _gn_reply(blender_scripts.GN_EVALUATED, {"object": object}, "reading evaluated geometry")
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_probe_socket(
+    ctx: Context,
+    object: str,
+    node: str,
+    socket: str,
+    modifier: str | None = None,
+    domain: str | None = None,
+    context: list[str] | None = None,
+    sample: int = 10,
+    user_prompt: str = "",
+) -> str:
+    """
+    Measure what one node output produces, to find the step where a Geometry Nodes tree goes
+    wrong. Works like plugging a Viewer into that socket; the tree itself is not changed.
+
+    - A geometry output: what it holds (counts, attributes, instances, bounding box), as
+      gn_get_evaluated_info reports for the whole modifier.
+    - A field output (float, int, vector, color, rotation, matrix, bool): its values evaluated on
+      the geometry of the node it feeds: count, min/max/mean, distinct ints, a sample.
+
+    Measures this modifier's output, with later modifiers in the stack left out. Nodes inside
+    nested groups can't be probed; probe the group node's outputs instead. Needs Blender 4.3+.
+
+    Parameters:
+    - object: Object whose Geometry Nodes modifier to probe.
+    - node: Node name in the modifier's tree.
+    - socket: Output id or name.
+    - modifier: Modifier name, when the object has several.
+    - domain: For fields: POINT (default), EDGE, FACE, CORNER, CURVE or INSTANCE.
+    - context: For fields: [node, geometry output] to evaluate on, when it isn't the geometry of
+      the node the field feeds.
+    - sample: How many values to list (at most 100).
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_PROBE, {
+        "object": object, "modifier": modifier, "node": node, "socket": socket, "domain": domain,
+        "context": context, "sample": sample}, "probing socket")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_read_attribute(
+    ctx: Context,
+    object: str,
+    name: str,
+    component: str | None = None,
+    sample: int = 10,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read one attribute of an object's evaluated geometry, like Blender's Spreadsheet: domain, type,
+    count, min/max/mean per channel, non-finite values, distinct values for ints, and a sample.
+    Use gn_get_evaluated_info to see which attributes exist. Needs Blender 4.3+.
+
+    Parameters:
+    - object: The object.
+    - name: Attribute name, e.g. "position" or one the tree stores.
+    - component: mesh, pointcloud, curves or instances; default every component that has it.
+    - sample: How many values to list (at most 100).
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_READ_ATTRIBUTE, {
+        "object": object, "name": name, "component": component, "sample": sample}, "reading attribute")
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 
