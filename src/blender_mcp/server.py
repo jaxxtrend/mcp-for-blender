@@ -1119,6 +1119,58 @@ async def gn_node_assets(
                      "reading node assets", read_only=not name)
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_preview_field(
+    ctx: Context,
+    node: str,
+    socket: str,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    size: float = 2.0,
+    resolution: int = 128,
+    center: list[float] | None = None,
+    user_prompt: str = "",
+) -> CallToolResult:
+    """
+    See a field as a picture: a noise or other texture, a gradient, or any chain of field nodes,
+    evaluated over a square grid in the XY plane (top view), plus its min/max/mean. Use it to pick
+    texture settings by looking instead of guessing; for example, Noise Fac stays near 0.25-0.75
+    rather than covering 0-1.
+
+    Scalars are grey from min (black) to max (white); vectors show X, Y, Z as red, green, blue,
+    each stretched to its own range; colors are shown as they are. The field gets the object's
+    modifier input values. It is evaluated on a flat grid at z=0, so fields that read the real
+    geometry (normals, named attributes, index) look different there; for those use
+    gn_probe_socket. Needs Blender 4.3+.
+
+    Parameters:
+    - node: Node whose output to draw.
+    - socket: Output id or name (float, int, bool, vector or color).
+    - object / modifier / tree: Which tree, as in gn_get_tree.
+    - size: Width of the square in meters (default 2).
+    - resolution: Pixels per side (default 128, at most 512).
+    - center: [x, y, z] of the square's center (default the origin).
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return _app_error("Error: give exactly one of object or tree")
+    path = os.path.join(tempfile.gettempdir(), f"blender_gn_preview_{os.getpid()}.png")
+    try:
+        info = _run_script(blender_scripts.GN_PREVIEW, {
+            "object": object, "modifier": modifier, "tree": tree, "node": node, "socket": socket, "size": size,
+            "resolution": resolution, "center": center, "filepath": path})
+    except Exception as e:
+        logger.error(f"Error previewing field: {e}")
+        return _app_error(f"Error previewing field: {e}")
+    if info.get("error"):
+        return _app_error(f"Error: {info['error']}")
+    with open(path, "rb") as f:
+        png = f.read()
+    os.remove(path)
+    return CallToolResult(content=[_png_content(png), TextContent(type="text", text=json.dumps(info))])
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 

@@ -646,6 +646,7 @@ The AI writes Blender Python itself for modelling, layout, materials, animation,
 | `gn_list_trees` | Every Geometry Nodes group in the file and who uses it |
 | `gn_bake` | Bake or free Bake nodes and simulation zones, or apply the modifier |
 | `gn_node_assets` | List and append ready-made groups from Blender's Essentials or your own asset libraries |
+| `gn_preview_field` | A top-view picture of any field (noise, Voronoi, gradients, field chains) with its min/max/mean (Blender 4.3+) |
 | `gn_set_inputs` | Change modifier inputs (values or attributes), node input values and node settings in place |
 | `gn_list_node_types` | Node types this Blender version has, or one type's settings and sockets for a given mode |
 | `gn_get_evaluated_info` | What the modifiers produced: counts, attributes, instances and the bounding box (Blender 4.3+) |

@@ -249,3 +249,19 @@ def test_essentials_assets_list_and_append():
     assert appended["appended"] == "Smooth by Angle" and "Angle" in appended["inputs"]
     assert bpy.data.node_groups["Smooth by Angle"].library is None
     assert "error" in run(blender_scripts.GN_ASSETS, name="Nope")
+
+
+def test_preview_field_draws_a_noise(tmp_path):
+    ground, _ = scatter_scene()
+    tree = bpy.data.node_groups["Scatter"]
+    noise = tree.nodes.new("ShaderNodeTexNoise")
+    path = str(tmp_path / "noise.png")
+    groups, objects, images = len(bpy.data.node_groups), len(bpy.data.objects), len(bpy.data.images)
+    result = run(blender_scripts.GN_PREVIEW, object="Ground", node=noise.name, socket="Fac", resolution=32,
+                 filepath=path)
+    assert result["values"]["count"] == 32 * 32 and 0.0 < result["values"]["min"] < result["values"]["max"] < 1.0
+    image = bpy.data.images.load(path)
+    assert tuple(image.size) == (32, 32)
+    bpy.data.images.remove(image)
+    assert (len(bpy.data.node_groups), len(bpy.data.objects), len(bpy.data.images)) == (groups, objects, images)
+    assert "GEOMETRY" in run(blender_scripts.GN_PREVIEW, object="Ground", node="Cube", socket="Mesh", filepath=path)["error"]

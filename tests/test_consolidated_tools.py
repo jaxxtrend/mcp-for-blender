@@ -13,7 +13,7 @@ MODEL_TOOLS = {
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
     "gn_get_tree", "gn_build_tree", "gn_set_inputs", "gn_list_node_types", "gn_get_evaluated_info",
     "gn_probe_socket", "gn_read_attribute", "gn_patch_tree", "gn_layout_tree", "gn_list_trees", "gn_bake",
-    "gn_group_nodes", "gn_node_assets",
+    "gn_group_nodes", "gn_node_assets", "gn_preview_field",
 }
 
 
@@ -42,7 +42,8 @@ def test_scripts_compile_and_never_raise_systemexit():
                    blender_scripts.GN_NODE_TYPES, blender_scripts.GN_EVALUATED, blender_scripts.GN_PROBE,
                    blender_scripts.GN_READ_ATTRIBUTE, blender_scripts.GN_PATCH,
                    blender_scripts.GN_LAYOUT, blender_scripts.GN_LIST_TREES, blender_scripts.GN_BAKE,
-                   blender_scripts.GN_GROUP_NODES, blender_scripts.GN_ASSETS):
+                   blender_scripts.GN_GROUP_NODES, blender_scripts.GN_ASSETS,
+                   blender_scripts.GN_PREVIEW):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code
@@ -168,6 +169,20 @@ def test_gn_errors_keep_what_the_script_reported(monkeypatch):
     assert reply == 'Error: no input \'X\' {"changed": ["Math.operation"]}'
     assert asyncio.run(server.gn_set_inputs(None, tree="T")).startswith("Error: nothing to set")
     assert asyncio.run(server.gn_build_tree(None, spec={})).startswith("Error: give exactly one")
+
+
+def test_gn_preview_field_returns_the_picture_and_stats(monkeypatch, tmp_path):
+    def fake_run(script, args, read_only=True):
+        assert script is blender_scripts.GN_PREVIEW and read_only
+        with open(args["filepath"], "wb") as f:
+            f.write(b"png")
+        return {"node": args["node"], "values": {"min": 0.25}}
+
+    monkeypatch.setattr(server, "_run_script", fake_run)
+    result = asyncio.run(server.gn_preview_field(None, node="Noise Texture", socket="Fac", tree="T"))
+    assert not result.isError and result.content[0].type == "image"
+    assert json.loads(result.content[1].text)["values"] == {"min": 0.25}
+    assert asyncio.run(server.gn_preview_field(None, node="N", socket="Fac")).isError
 
 
 class _Blender:

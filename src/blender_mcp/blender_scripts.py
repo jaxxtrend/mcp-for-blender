@@ -2043,3 +2043,100 @@ try:
 except GNError as e:
     return {"error": str(e)}
 '''
+
+
+# A picture of a field (a noise, a gradient, any chain of field nodes) over a
+# square grid in the XY plane, with its statistics. The field is evaluated by a
+# copy of the tree on a temporary object that gets the modifier's input values;
+# everything temporary is removed afterwards. Scalars are drawn in grey from min
+# to max, vectors with each channel stretched to its own range, colors as they are.
+GN_PREVIEW = _GN_COMMON + _GN_GEOMETRY + r'''
+PREVIEW = "__mcp_preview__"
+STORE_TYPES = {"VALUE": "FLOAT", "INT": "INT", "BOOLEAN": "BOOLEAN", "VECTOR": "FLOAT_VECTOR", "RGBA": "FLOAT_COLOR"}
+
+try:
+    tree, obj, mod = find_tree(ARGS)
+    node = find_node(tree, ARGS["node"])
+    socket = find_socket(node, ARGS["socket"], output=True)
+    if socket.type not in STORE_TYPES:
+        raise GNError(f"can't draw a {socket.type} socket; fields of type {sorted(STORE_TYPES)} can be drawn"
+                      + (" (use gn_probe_socket for geometry)" if socket.type == "GEOMETRY" else ""))
+    socket_id = socket.identifier
+except GNError as e:
+    return {"error": str(e)}
+resolution = max(8, min(int(ARGS.get("resolution") or 128), 512))
+size = float(ARGS.get("size") or 2.0)
+
+work = tree.copy()
+mesh = bpy.data.meshes.new(PREVIEW)
+holder = bpy.data.objects.new(PREVIEW, mesh)
+bpy.context.scene.collection.objects.link(holder)
+try:
+    source = find_socket(work.nodes[node.name], socket_id, output=True)
+    output = next((s for n in work.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output
+                   for s in n.inputs if s.type == "GEOMETRY"), None)
+    if output is None:
+        raise GNError(f"{tree.name!r} has no geometry output to evaluate through")
+    grid = work.nodes.new("GeometryNodeMeshGrid")
+    grid.inputs["Size X"].default_value = grid.inputs["Size Y"].default_value = size
+    grid.inputs["Vertices X"].default_value = grid.inputs["Vertices Y"].default_value = resolution
+    move = work.nodes.new("GeometryNodeTransform")
+    move.inputs["Translation"].default_value = ARGS.get("center") or (0.0, 0.0, 0.0)
+    store = work.nodes.new("GeometryNodeStoreNamedAttribute")
+    store.data_type = STORE_TYPES[socket.type]
+    store.inputs["Name"].default_value = PREVIEW
+    work.links.new(grid.outputs["Mesh"], move.inputs["Geometry"])
+    work.links.new(move.outputs["Geometry"], store.inputs["Geometry"])
+    work.links.new(source, store.inputs["Value"])
+    work.links.new(store.outputs["Geometry"], output)
+    preview = holder.modifiers.new(PREVIEW, "NODES")
+    preview.node_group = work
+    if mod is not None:
+        # The field may read group inputs: give it the values the user's modifier has.
+        for key in mod.keys():
+            preview[key] = mod[key]
+        holder.matrix_world = obj.matrix_world
+    geo = holder.evaluated_get(bpy.context.evaluated_depsgraph_get()).evaluated_geometry()
+    attr = geo.mesh.attributes.get(PREVIEW) if geo.mesh else None
+    if attr is None:
+        raise GNError("the field produced no values on the preview grid")
+    values = attribute_values(attr).astype(np.float64)
+    positions = attribute_values(geo.mesh.attributes["position"])
+    stats = attribute_stats(attr, 0)
+    for key in ("name", "domain", "sample"):
+        stats.pop(key)
+
+    # Grid vertices to pixels by position, so the picture doesn't depend on vertex order.
+    span = positions.max(axis=0) - positions.min(axis=0)
+    ix = np.rint((positions[:, 0] - positions[:, 0].min()) / max(span[0], 1e-9) * (resolution - 1)).astype(int)
+    iy = np.rint((positions[:, 1] - positions[:, 1].min()) / max(span[1], 1e-9) * (resolution - 1)).astype(int)
+    finite = np.where(np.isfinite(values), values, 0.0)
+    if socket.type == "RGBA":
+        rgb = np.clip(finite[:, :3], 0.0, 1.0)
+    else:
+        lo, hi = finite.min(axis=0), finite.max(axis=0)
+        scaled = (finite - lo) / np.where(hi > lo, hi - lo, 1.0)
+        rgb = np.repeat(scaled, 3, axis=1) if scaled.shape[1] == 1 else scaled[:, :3]
+    pixels = np.zeros((resolution, resolution, 4), dtype=np.float32)
+    pixels[iy, ix, :3] = rgb
+    pixels[..., 3] = 1.0
+    image = bpy.data.images.new(PREVIEW, resolution, resolution, alpha=True)
+    try:
+        image.pixels.foreach_set(pixels.ravel())
+        image.filepath_raw = ARGS["filepath"]
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+    return {"node": node.name, "socket": socket_id, "socket_type": socket.type, "size": size,
+            "resolution": resolution, "center": list(ARGS.get("center") or (0, 0, 0)), "values": stats,
+            "picture": "top view, +X right, +Y up; " + ("colors as they are" if socket.type == "RGBA" else
+                       "black = min, white = max" if socket.type in {"VALUE", "INT", "BOOLEAN"} else
+                       "X, Y, Z as red, green, blue, each from its min to its max")}
+except GNError as e:
+    return {"error": str(e)}
+finally:
+    bpy.data.objects.remove(holder)
+    bpy.data.meshes.remove(mesh)
+    bpy.data.node_groups.remove(work)
+'''
