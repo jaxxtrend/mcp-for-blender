@@ -1715,3 +1715,243 @@ for c in sorted(by_column):
         y -= height(n) + gap_y
 return {"tree": tree.name, "nodes": len(nodes), "columns": len(by_column)}
 '''
+
+
+# Every Geometry Nodes group in the file: its interface, flags, and who uses it
+# (object modifiers, other groups).
+GN_LIST_TREES = _GN_COMMON + r'''
+by_modifier, by_group = {}, {}
+for obj in bpy.data.objects:
+    for mod in gn_modifiers(obj):
+        if mod.node_group:
+            by_modifier.setdefault(mod.node_group.name, []).append([obj.name, mod.name])
+trees = [g for g in bpy.data.node_groups if g.bl_idname == "GeometryNodeTree"]
+for tree in trees:
+    for node in tree.nodes:
+        if node.bl_idname == "GeometryNodeGroup" and node.node_tree:
+            by_group.setdefault(node.node_tree.name, set()).add(tree.name)
+out = []
+for tree in trees:
+    sockets = [i for i in tree.interface.items_tree if i.item_type == "SOCKET"]
+    entry = {"name": tree.name, "nodes": len(tree.nodes),
+             "inputs": [i.name for i in sockets if i.in_out == "INPUT"],
+             "outputs": [i.name for i in sockets if i.in_out == "OUTPUT"],
+             "is_modifier": tree.is_modifier, "is_tool": tree.is_tool,
+             "modifiers": by_modifier.get(tree.name, []), "used_in": sorted(by_group.get(tree.name, ()))}
+    if tree.description:
+        entry["description"] = tree.description
+    if tree.asset_data:
+        entry["asset"] = True
+    if tree.library:
+        entry["library"] = tree.library.filepath
+    if tree.use_fake_user:
+        entry["fake_user"] = True
+    out.append(entry)
+return {"trees": out}
+'''
+
+
+# Bakes (Bake nodes and simulation zones) of a Geometry Nodes modifier, freeing
+# them, or applying the modifier. These are Blender operators, run with the
+# object as context.
+GN_BAKE = _GN_COMMON + r'''
+try:
+    obj = find_object(ARGS["object"])
+    mod = find_modifier(obj, ARGS.get("modifier"))
+    action = ARGS["action"]
+    with bpy.context.temp_override(object=obj, active_object=obj, selected_objects=[obj]):
+        if action == "apply":
+            name = mod.name
+            try:
+                bpy.ops.object.modifier_apply(modifier=name)
+            except RuntimeError as e:
+                raise GNError(f"can't apply {name!r}: {e}")
+            return {"action": action, "applied": name, "modifiers": [m.name for m in obj.modifiers]}
+        if action not in {"bake", "free"}:
+            raise GNError(f"unknown action {action!r}: bake, free or apply")
+        bakes = [b for b in mod.bakes if not ARGS.get("node") or (b.node and b.node.name == ARGS["node"])]
+        if not bakes:
+            raise GNError(f"{mod.name!r} has no " + (f"bake node {ARGS['node']!r}" if ARGS.get("node") else
+                          "Bake nodes or simulation zones"))
+        if ARGS.get("target"):
+            mod.bake_target = ARGS["target"]
+        done = []
+        for b in bakes:
+            op = bpy.ops.object.geometry_node_bake_single if action == "bake" else bpy.ops.object.geometry_node_bake_delete_single
+            try:
+                op(session_uid=obj.session_uid, modifier_name=mod.name, bake_id=b.bake_id)
+            except RuntimeError as e:
+                raise GNError(f"can't {action} {b.node.name if b.node else b.bake_id!r}: {e}")
+            done.append({"node": b.node.name if b.node else None, "mode": b.bake_mode})
+    target = mod.bake_target
+    return {"action": action, "bakes": done, "target": target}
+except GNError as e:
+    return {"error": str(e)}
+'''
+
+
+# Collapses nodes into a new node group (linked through its interface) or
+# expands a group node back into the tree. Runs on a copy like a patch, so a
+# failure changes nothing.
+GN_GROUP_NODES = _GN_COMMON + _GN_EDIT + r'''
+import copy
+
+GROUP_IO = {"NodeGroupInput", "NodeGroupOutput"}
+INTERFACE_TYPES = {
+    "VALUE": "NodeSocketFloat", "INT": "NodeSocketInt", "BOOLEAN": "NodeSocketBool", "VECTOR": "NodeSocketVector",
+    "RGBA": "NodeSocketColor", "STRING": "NodeSocketString", "ROTATION": "NodeSocketRotation",
+    "MATRIX": "NodeSocketMatrix", "MENU": "NodeSocketMenu", "GEOMETRY": "NodeSocketGeometry",
+    "OBJECT": "NodeSocketObject", "COLLECTION": "NodeSocketCollection", "MATERIAL": "NodeSocketMaterial",
+    "IMAGE": "NodeSocketImage", "TEXTURE": "NodeSocketTexture", "BUNDLE": "NodeSocketBundle",
+    "CLOSURE": "NodeSocketClosure", "SHADER": "NodeSocketShader",
+}
+
+def interface_type(socket):
+    if socket.type not in INTERFACE_TYPES:
+        raise GNError(f"can't pass a {socket.type} socket through a group interface")
+    return INTERFACE_TYPES[socket.type]
+
+def center(specs):
+    xs = [e["location"][0] for e in specs]
+    ys = [e["location"][1] for e in specs]
+    return [sum(xs) / len(xs), sum(ys) / len(ys)], min(xs), max(xs)
+
+def make_group(tree):
+    names = ARGS.get("nodes") or []
+    if not names:
+        raise GNError("give the names of the nodes to group in nodes=")
+    chosen = set(names)
+    for name in names:
+        if find_node(tree, name).bl_idname in GROUP_IO:
+            raise GNError(f"{name!r} is a group input/output node and can't go into a group")
+    for node in tree.nodes:
+        paired = getattr(node, "paired_output", None)
+        if paired is not None and (node.name in chosen) != (paired.name in chosen):
+            raise GNError(f"zone {node.name!r} / {paired.name!r}: group both ends of a zone or neither")
+    dump = dump_tree(tree)
+    specs = [copy.deepcopy(e) for e in dump["nodes"] if e["name"] in chosen]
+    for e in specs:
+        if e.get("parent") not in chosen:
+            e.pop("parent", None)
+    inside = [e for e in dump["links"] if e["from"][0] in chosen and e["to"][0] in chosen]
+
+    group = bpy.data.node_groups.new(ARGS.get("name") or "Group", "GeometryNodeTree")
+    try:
+        inputs, outputs, incoming, outgoing = {}, {}, [], []
+        for link in tree.links:
+            src_in, dst_in = link.from_node.name in chosen, link.to_node.name in chosen
+            key = (link.from_node.name, link.from_socket.identifier)
+            if dst_in and not src_in:
+                if key not in inputs:
+                    # Named after the tree input it passes on, else after the input it feeds.
+                    name = link.from_socket.name if link.from_node.bl_idname == "NodeGroupInput" else link.to_socket.name
+                    inputs[key] = group.interface.new_socket(
+                        name, in_out="INPUT", socket_type=interface_type(link.to_socket)).identifier
+                incoming.append((key, link.to_node.name, link.to_socket.identifier))
+            elif src_in and not dst_in:
+                if key not in outputs:
+                    outputs[key] = group.interface.new_socket(
+                        link.from_socket.name, in_out="OUTPUT", socket_type=interface_type(link.from_socket)).identifier
+                outgoing.append((key, link.to_node.name, link.to_socket.identifier))
+        (cx, cy), lo, hi = center(specs)
+        group_in, group_out = group.nodes.new("NodeGroupInput"), group.nodes.new("NodeGroupOutput")
+        group_in.location, group_out.location = (lo - 250, cy), (hi + 250, cy)
+        sockets = Sockets()
+        add_nodes(group, specs, sockets)
+        add_links(group, inside, sockets)
+        for key, to_node, to_id in incoming:
+            group.links.new(find_socket(group_in, inputs[key], output=True), sockets.get(group.nodes[to_node], to_id))
+        for key, to_node, to_id in outgoing:
+            group.links.new(sockets.get(group.nodes[key[0]], key[1], output=True), find_socket(group_out, outputs[key]))
+
+        node = tree.nodes.new("GeometryNodeGroup")
+        node.node_tree = group
+        node.name = group.name
+        node.location = (cx, cy)
+        parents = {e.get("parent") for e in dump["nodes"] if e["name"] in chosen}
+        if len(parents) == 1 and None not in parents and parents <= set(tree.nodes.keys()) - chosen:
+            node.parent = tree.nodes[parents.pop()]
+        for key, _, _ in incoming:
+            if not find_socket(node, inputs[key]).is_linked:
+                tree.links.new(find_socket(tree.nodes[key[0]], key[1], output=True), find_socket(node, inputs[key]))
+        for key, to_node, to_id in outgoing:
+            tree.links.new(find_socket(node, outputs[key], output=True), find_socket(tree.nodes[to_node], to_id))
+        for name in names:
+            tree.nodes.remove(tree.nodes[name])
+    except BaseException:
+        bpy.data.node_groups.remove(group)
+        raise
+    sockets = [i for i in group.interface.items_tree if i.item_type == "SOCKET"]
+    return {"group": group.name, "node": node.name,
+            "inputs": [i.name for i in sockets if i.in_out == "INPUT"],
+            "outputs": [i.name for i in sockets if i.in_out == "OUTPUT"]}
+
+def ungroup(tree):
+    node = find_node(tree, ARGS.get("node") or "")
+    if node.bl_idname != "GeometryNodeGroup" or node.node_tree is None:
+        raise GNError(f"{node.name!r} is not a group node")
+    inner = node.node_tree
+    dump = dump_tree(inner)
+    io = {n.name for n in inner.nodes if n.bl_idname in GROUP_IO}
+    specs = [copy.deepcopy(e) for e in dump["nodes"] if e["name"] not in io]
+    renamed, taken = {}, set(tree.nodes.keys()) - {node.name}
+    for e in specs:
+        new = e["name"]
+        count = 0
+        while new in taken:
+            count += 1
+            new = f"{e['name']}.{node.name}" + (f".{count}" if count > 1 else "")
+        renamed[e["name"]] = new
+        taken.add(new)
+    if specs:
+        (cx, cy), _, _ = center(specs)
+        dx, dy = node.location.x - cx, node.location.y - cy
+    for e in specs:
+        e["name"] = renamed[e["name"]]
+        if e.get("parent"):
+            e["parent"] = renamed[e["parent"]]
+        elif node.parent:
+            e["parent"] = node.parent.name
+        if (e.get("props") or {}).get("paired_output"):
+            e["props"]["paired_output"] = renamed[e["props"]["paired_output"]]
+        e["location"] = [e["location"][0] + dx, e["location"][1] + dy]
+    sockets = Sockets()
+    add_nodes(tree, specs, sockets)
+    add_links(tree, [{**e, "from": [renamed[e["from"][0]], e["from"][1]], "to": [renamed[e["to"][0]], e["to"][1]]}
+                     for e in dump["links"] if e["from"][0] not in io and e["to"][0] not in io], sockets)
+    sources = {s.identifier: (s.links[0].from_socket if s.is_linked else None, s) for s in node.inputs}
+    targets = {s.identifier: [l.to_socket for l in s.links] for s in node.outputs}
+    for link in inner.links:
+        from_io, to_io = link.from_node.name in io, link.to_node.name in io
+        if from_io and link.from_socket.identifier not in sources:
+            continue
+        if from_io and to_io:
+            source = sources[link.from_socket.identifier][0]
+            for target in targets.get(link.to_socket.identifier, []):
+                if source is not None:
+                    tree.links.new(source, target)
+        elif from_io:
+            target = sockets.get(tree.nodes[renamed[link.to_node.name]], link.to_socket.identifier)
+            source, group_socket = sources[link.from_socket.identifier]
+            if source is not None:
+                tree.links.new(source, target)
+            elif hasattr(group_socket, "default_value") and hasattr(target, "default_value"):
+                # The group node's own value for that input moves to the node that used it.
+                set_socket_value(target, value(group_socket.default_value))
+        elif to_io:
+            source = sockets.get(tree.nodes[renamed[link.from_node.name]], link.from_socket.identifier, output=True)
+            for target in targets.get(link.to_socket.identifier, []):
+                tree.links.new(source, target)
+    tree.nodes.remove(node)
+    return {"ungrouped": inner.name, "added_nodes": list(renamed.values())}
+
+try:
+    tree, obj, mod = find_tree(ARGS)
+    action = ARGS.get("action")
+    if action not in {"group", "ungroup"}:
+        raise GNError(f"unknown action {action!r}: group or ungroup")
+    work, result = edit_on_copy(tree, make_group if action == "group" else ungroup)
+except GNError as e:
+    return {"error": str(e)}
+return {**edit_summary(work), **result}
+'''

@@ -1001,6 +1001,93 @@ async def gn_read_attribute(
         "object": object, "name": name, "component": component, "sample": sample}, "reading attribute")
 
 
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def gn_list_trees(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Every Geometry Nodes group in the file: node count, interface inputs and outputs, whether it
+    is a modifier or a tool, which object modifiers use it, which groups contain it, and whether it
+    is an asset or linked from a library.
+
+    Parameters:
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_LIST_TREES, {}, "listing node trees")
+
+
+@mcp.tool()
+async def gn_bake(
+    ctx: Context,
+    object: str,
+    action: str,
+    modifier: str | None = None,
+    node: str | None = None,
+    target: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Bake or free a Geometry Nodes modifier's bakes (Bake nodes and simulation zones), or apply
+    the modifier to the object's mesh.
+
+    - action="bake": bakes every bake of the modifier, or only the Bake node or simulation zone
+      named in node. Simulations bake their frame range, which can take a while.
+    - action="free": deletes the baked data.
+    - action="apply": applies the modifier, like Ctrl+A in the modifier panel. Only the mesh is
+      kept: instances, point clouds and curves are lost, so add Realize Instances first if the
+      result is instances. It can't be undone from here.
+
+    Parameters:
+    - object: The object.
+    - action: bake, free or apply.
+    - modifier: Modifier name, when the object has several.
+    - node: Bake node or simulation output node to bake or free; default all.
+    - target: Where bakes go: PACKED (into the .blend file) or DISK (needs a saved file or a bake
+      directory). Default: the modifier's setting.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_BAKE, {"object": object, "action": action, "modifier": modifier,
+                                               "node": node, "target": target}, f"running {action}", read_only=False)
+
+
+@mcp.tool()
+async def gn_group_nodes(
+    ctx: Context,
+    action: str,
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    nodes: list[str] | None = None,
+    node: str | None = None,
+    name: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Collapse nodes into a new node group, or expand a group node back into its tree, like Ctrl+G
+    and Ctrl+Alt+G. Give exactly one of object or tree, as in gn_get_tree.
+
+    - action="group" with nodes=[names]: makes a group of those nodes. Links that cross the
+      selection become the group's inputs and outputs, and a group node takes their place. Both
+      ends of a zone must be included or left out.
+    - action="ungroup" with node=name: puts the group's nodes in place of that group node, linked
+      as before; inputs the group node set by value move to the nodes that used them. Nodes whose
+      names are taken get the group node's name added.
+
+    Works on a copy, so a failure changes nothing.
+
+    Parameters:
+    - action: group or ungroup.
+    - object / modifier / tree: Which tree, as in gn_get_tree.
+    - nodes: For group: names of the nodes to put in the group.
+    - node: For ungroup: the group node to expand.
+    - name: For group: the new group's name (default "Group").
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    return _gn_reply(blender_scripts.GN_GROUP_NODES, {
+        "action": action, "object": object, "modifier": modifier, "tree": tree, "nodes": nodes, "node": node,
+        "name": name}, f"running {action}", read_only=False)
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 

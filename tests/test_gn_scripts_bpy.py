@@ -209,3 +209,33 @@ def test_layout_runs_left_to_right_without_overlaps():
         by_column.setdefault(round(n.location_absolute.x), []).append(n.location_absolute.y)
     for ys in by_column.values():
         assert len(set(ys)) == len(ys)
+
+
+def test_group_and_ungroup_keep_the_result():
+    scatter_scene()
+    def instances():
+        return run(blender_scripts.GN_EVALUATED, object="Ground")["instances"]["count"]
+    assert instances() == 400
+    grouped = run(blender_scripts.GN_GROUP_NODES, object="Ground", action="group", name="Scatter Cubes",
+                  nodes=["Distribute Points on Faces", "Cube", "Instance on Points"])
+    assert grouped["inputs"] == ["Geometry", "Density"] and grouped["outputs"] == ["Instances"]
+    assert instances() == 400
+    listed = {t["name"]: t for t in run(blender_scripts.GN_LIST_TREES)["trees"]}
+    assert listed["Scatter Cubes"]["used_in"] == ["Scatter"] and listed["Scatter"]["modifiers"] == [["Ground", "Scatter"]]
+    ungrouped = run(blender_scripts.GN_GROUP_NODES, object="Ground", action="ungroup", node="Scatter Cubes")
+    assert sorted(ungrouped["added_nodes"]) == ["Cube", "Distribute Points on Faces", "Instance on Points"]
+    assert instances() == 400
+
+
+def test_bake_free_and_apply():
+    ground, _ = scatter_scene()
+    tree = bpy.data.node_groups["Scatter"]
+    bake = tree.nodes.new("GeometryNodeBake")
+    bake.bake_items.new("GEOMETRY", "Geometry")
+    tree.links.new(tree.nodes["Join Geometry"].outputs[0], bake.inputs[0])
+    tree.links.new(bake.outputs[0], tree.nodes["Group Output"].inputs[0])
+    assert run(blender_scripts.GN_BAKE, object="Ground", action="bake", target="PACKED")["bakes"] == [
+        {"node": "Bake", "mode": "STILL"}]
+    assert run(blender_scripts.GN_BAKE, object="Ground", action="free")["action"] == "free"
+    assert run(blender_scripts.GN_BAKE, object="Ground", action="apply")["modifiers"] == []
+    assert len(ground.data.vertices) == 4
