@@ -13,7 +13,7 @@ MODEL_TOOLS = {
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
     "gn_get_tree", "gn_build_tree", "gn_set_inputs", "gn_list_node_types", "gn_get_evaluated_info",
     "gn_probe_socket", "gn_read_attribute", "gn_patch_tree", "gn_layout_tree", "gn_list_trees", "gn_bake",
-    "gn_group_nodes",
+    "gn_group_nodes", "gn_node_assets",
 }
 
 
@@ -42,7 +42,7 @@ def test_scripts_compile_and_never_raise_systemexit():
                    blender_scripts.GN_NODE_TYPES, blender_scripts.GN_EVALUATED, blender_scripts.GN_PROBE,
                    blender_scripts.GN_READ_ATTRIBUTE, blender_scripts.GN_PATCH,
                    blender_scripts.GN_LAYOUT, blender_scripts.GN_LIST_TREES, blender_scripts.GN_BAKE,
-                   blender_scripts.GN_GROUP_NODES):
+                   blender_scripts.GN_GROUP_NODES, blender_scripts.GN_ASSETS):
         code = blender_scripts.build(script, {"mode": "angles", "target": None, "flag": True, "none": None})
         ast.parse(code)
         assert "SystemExit" not in code and "sys.exit" not in code
@@ -152,7 +152,10 @@ def test_gn_tools_mark_only_edits_as_edits(monkeypatch):
     asyncio.run(server.gn_list_trees(None))
     asyncio.run(server.gn_bake(None, object="Cube", action="bake"))
     asyncio.run(server.gn_group_nodes(None, action="group", tree="T", nodes=["Math"]))
-    assert calls == {blender_scripts.GN_LIST_TREES: True, blender_scripts.GN_BAKE: False,
+    asyncio.run(server.gn_node_assets(None))
+    assert calls[blender_scripts.GN_ASSETS] is True
+    asyncio.run(server.gn_node_assets(None, name="Smooth by Angle"))
+    assert calls == {blender_scripts.GN_ASSETS: False, blender_scripts.GN_LIST_TREES: True, blender_scripts.GN_BAKE: False,
                      blender_scripts.GN_GROUP_NODES: False, blender_scripts.GN_LAYOUT: False, blender_scripts.GN_PATCH: False, blender_scripts.GN_PROBE: True, blender_scripts.GN_READ_ATTRIBUTE: True, blender_scripts.GN_TREE: True, blender_scripts.GN_BUILD: False,
                      blender_scripts.GN_SET_INPUTS: False, blender_scripts.GN_NODE_TYPES: True,
                      blender_scripts.GN_EVALUATED: True}

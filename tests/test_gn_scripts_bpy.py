@@ -239,3 +239,13 @@ def test_bake_free_and_apply():
     assert run(blender_scripts.GN_BAKE, object="Ground", action="free")["action"] == "free"
     assert run(blender_scripts.GN_BAKE, object="Ground", action="apply")["modifiers"] == []
     assert len(ground.data.vertices) == 4
+
+
+def test_essentials_assets_list_and_append():
+    listed = run(blender_scripts.GN_ASSETS, query="smooth angle")["assets"]
+    assert [a["name"] for a in listed] == ["Smooth by Angle"]
+    assert len(bpy.data.libraries) == 0 and len(bpy.data.node_groups) == 0
+    appended = run(blender_scripts.GN_ASSETS, name="Smooth by Angle")
+    assert appended["appended"] == "Smooth by Angle" and "Angle" in appended["inputs"]
+    assert bpy.data.node_groups["Smooth by Angle"].library is None
+    assert "error" in run(blender_scripts.GN_ASSETS, name="Nope")

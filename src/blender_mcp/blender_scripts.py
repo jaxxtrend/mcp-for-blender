@@ -1955,3 +1955,91 @@ except GNError as e:
     return {"error": str(e)}
 return {**edit_summary(work), **result}
 '''
+
+
+# Geometry Nodes groups in asset files: Blender's own Essentials, or the user's
+# asset libraries from Preferences. Listing links each file for a moment to read
+# its groups' types and descriptions, then removes the link again; files the
+# user has linked already are skipped, so their links stay as they are.
+GN_ASSETS = _GN_COMMON + r'''
+import glob
+import os
+
+def asset_files(source):
+    if source not in {"essentials", "user", "all"}:
+        raise GNError(f"unknown source {source!r}: essentials, user or all")
+    roots = []
+    if source in {"essentials", "all"}:
+        roots.append(("essentials", bpy.utils.system_resource("DATAFILES", path="assets")))
+    if source in {"user", "all"}:
+        roots += [(lib.name, lib.path) for lib in bpy.context.preferences.filepaths.asset_libraries]
+    for label, root in roots:
+        if root and os.path.isdir(root):
+            for path in sorted(glob.glob(os.path.join(root, "**", "*.blend"), recursive=True)):
+                yield label, path
+
+def loaded_library(path):
+    for lib in bpy.data.libraries:
+        if os.path.exists(bpy.path.abspath(lib.filepath)) and os.path.samefile(bpy.path.abspath(lib.filepath), path):
+            return lib
+    return None
+
+def list_assets(source, words):
+    found, skipped = [], []
+    for label, path in asset_files(source):
+        with bpy.data.libraries.load(path, assets_only=True) as (src, dst):
+            if not src.node_groups:
+                continue
+        if loaded_library(path):
+            skipped.append(path)
+            continue
+        with bpy.data.libraries.load(path, link=True, assets_only=True) as (src, dst):
+            dst.node_groups = list(src.node_groups)
+        try:
+            for group in dst.node_groups:
+                if group is None or group.bl_idname != "GeometryNodeTree":
+                    continue
+                description = group.asset_data.description if group.asset_data else ""
+                text = f"{group.name} {description}".lower()
+                if all(w in text for w in words):
+                    found.append({"name": group.name, "description": description, "library": label,
+                                  "file": os.path.basename(path)})
+        finally:
+            bpy.data.libraries.remove(loaded_library(path))
+    out = {"assets": found}
+    if source in {"user", "all"}:
+        out["user_libraries"] = [[lib.name, lib.path] for lib in bpy.context.preferences.filepaths.asset_libraries]
+    if skipped:
+        out["skipped_linked_files"] = skipped
+    return out
+
+def append_asset(source, name, file_name):
+    matches = []
+    for label, path in asset_files(source):
+        if file_name and os.path.basename(path) != file_name:
+            continue
+        with bpy.data.libraries.load(path, assets_only=True) as (src, dst):
+            if name in src.node_groups:
+                matches.append(path)
+    if not matches:
+        raise GNError(f"no asset node group {name!r} in {source} asset files")
+    if len(matches) > 1:
+        raise GNError(f"{name!r} is in several files, pass file=: {[os.path.basename(p) for p in matches]}")
+    before = set(bpy.data.node_groups)
+    with bpy.data.libraries.load(matches[0], link=False) as (src, dst):
+        dst.node_groups = [name]
+    group = dst.node_groups[0]
+    added = sorted(g.name for g in set(bpy.data.node_groups) - before)
+    sockets = [i for i in group.interface.items_tree if i.item_type == "SOCKET"]
+    return {"appended": group.name, "file": os.path.basename(matches[0]), "added_groups": added,
+            "inputs": [i.name for i in sockets if i.in_out == "INPUT"],
+            "outputs": [i.name for i in sockets if i.in_out == "OUTPUT"]}
+
+try:
+    source = ARGS.get("source") or "essentials"
+    if ARGS.get("name"):
+        return append_asset(source, ARGS["name"], ARGS.get("file"))
+    return list_assets(source, (ARGS.get("query") or "").lower().split())
+except GNError as e:
+    return {"error": str(e)}
+'''

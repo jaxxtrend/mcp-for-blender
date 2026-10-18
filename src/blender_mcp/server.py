@@ -1088,6 +1088,37 @@ async def gn_group_nodes(
         "name": name}, f"running {action}", read_only=False)
 
 
+@mcp.tool()
+async def gn_node_assets(
+    ctx: Context,
+    query: str | None = None,
+    name: str | None = None,
+    file: str | None = None,
+    source: str = "essentials",
+    user_prompt: str = "",
+) -> str:
+    """
+    Ready-made Geometry Nodes groups from asset files: Blender's Essentials (Smooth by Angle,
+    Sphere Selection, the hair curve tools ...) or the user's own asset libraries. Use one instead
+    of building what already exists.
+
+    Without name: lists [name, description, library, file]; query="smooth" keeps groups whose
+    name or description contains every word.
+    With name: appends that group (and the groups it uses) to the file and returns its interface;
+    then add it as a group node with gn_patch_tree or put it on an object with gn_apply_group.
+    Appending again makes a copy (".001"); use gn_list_trees to find one already in the file.
+
+    Parameters:
+    - query: Words to filter the list by.
+    - name: The group to append.
+    - file: The asset file's name, when the group name is in several files.
+    - source: essentials (default), user (the asset libraries set in Preferences) or all.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_ASSETS, {"query": query, "name": name, "file": file, "source": source},
+                     "reading node assets", read_only=not name)
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 
