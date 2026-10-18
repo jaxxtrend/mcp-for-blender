@@ -808,6 +808,8 @@ def dump_interface(tree):
                     entry[key.replace("_value", "")] = value(getattr(item, key))
             if getattr(item, "default_input", "VALUE") != "VALUE":
                 entry["default_input"] = item.default_input
+            if item.description:
+                entry["description"] = item.description
         if parent:
             entry["in_panel"] = parent
         items.append(entry)
@@ -899,17 +901,43 @@ return result
 '''
 
 
-# Builds a whole tree from a spec in gn_get_tree's format. The build runs on a
-# copy, which replaces the original only once everything succeeded, so a bad
-# spec leaves the user's tree untouched. Interface sockets whose id matches an
-# existing one are kept (so values set on modifiers survive); links to group
-# input/output sockets are translated to the ids the interface ends up with.
-GN_BUILD = _GN_COMMON + r'''
+# Shared by the scripts that change a tree: adding nodes and links from specs in
+# gn_get_tree's format, syncing the interface, and editing on a copy that
+# replaces the original only once the whole edit succeeded.
+_GN_EDIT = r'''
 import re
 
-spec = ARGS["spec"]
+def set_interface_socket(item, e):
+    if "default" in e:
+        item.default_value = to_socket_value(e["type"], e["default"])
+    # Settings the spec leaves out go back to Blender's defaults, so a kept
+    # socket doesn't keep old ones (the dump omits "no limit" and VALUE).
+    if hasattr(item, "min_value"):
+        is_int = isinstance(item.min_value, int)
+        limit = 2**31 - 1 if is_int else FLT_MAX
+        item.min_value = e.get("min", -limit - is_int)
+        item.max_value = e.get("max", limit)
+    if hasattr(item, "default_input"):
+        item.default_input = e.get("default_input", "VALUE")
+    item.description = e.get("description", "")
+
+def interface_root(tree):
+    for item in tree.interface.items_tree:
+        root = item
+        while root.parent is not None:
+            root = root.parent
+        return root
+    return None
+
+def interface_panel(tree, name):
+    for item in tree.interface.items_tree:
+        if item.item_type == "PANEL" and item.name == name:
+            return item
+    raise GNError(f"{tree.name!r} has no interface panel {name!r}")
 
 def sync_interface(tree, items):
+    """Make the interface match the spec; sockets keep their identifier when the spec gives it.
+    Returns {spec id: identifier}."""
     iface = tree.interface
     sockets = {i.identifier: i for i in iface.items_tree if i.item_type == "SOCKET"}
     keep = {e["id"] for e in items if "panel" not in e and e.get("id") in sockets
@@ -934,22 +962,12 @@ def sync_interface(tree, items):
                 item.name = e["name"]
                 if item.socket_type != e["type"]:
                     item.socket_type = e["type"]
-            if "default" in e:
-                item.default_value = to_socket_value(e["type"], e["default"])
-            # A kept socket must not keep old settings the spec leaves out (it omits "no limit" and VALUE).
-            if hasattr(item, "min_value"):
-                limit = 2**31 - 1 if isinstance(item.min_value, int) else FLT_MAX
-                item.min_value = e.get("min", -limit - isinstance(item.min_value, int))
-                item.max_value = e.get("max", limit)
-            if hasattr(item, "default_input"):
-                item.default_input = e.get("default_input", "VALUE")
+            set_interface_socket(item, e)
             if e.get("id"):
                 id_map[e["id"]] = item.identifier
         placed.append((e, item))
     if placed:
-        root = placed[0][1]
-        while root.parent is not None:
-            root = root.parent
+        root = interface_root(tree)
         positions = {}
         for e, item in placed:
             if e.get("in_panel") and e["in_panel"] not in panels:
@@ -960,44 +978,29 @@ def sync_interface(tree, items):
             positions[parent.as_pointer()] = position + 1
     return id_map
 
-def build(tree):
-    id_map = sync_interface(tree, spec.get("interface", []))
-    specs = spec.get("nodes", [])
-    names = [e["name"] for e in specs]
-    duplicates = sorted({n for n in names if names.count(n) > 1})
-    if duplicates:
-        raise GNError(f"node names must be unique: {duplicates}")
-    tree.nodes.clear()
-    nodes = {}
-    for e in specs:
-        try:
-            node = tree.nodes.new(e["type"])
-        except RuntimeError as ex:
-            raise GNError(f"node {e['name']!r}: can't add a {e['type']!r} to a Geometry Nodes tree ({ex})")
-        node.name = e["name"]
-        node.label = e.get("label", "")
-        node.mute = e.get("mute", False)
-        nodes[e["name"]] = node
+class Sockets:
+    """Finds the sockets that node and link specs name.
 
-    def node_named(name, used_by):
-        if name not in nodes:
-            raise GNError(f"{used_by} names unknown node {name!r}")
-        return nodes[name]
+    Socket ids can come out different from a spec's: recreated item lists
+    (zones, capture, menu switch) number their sockets on, and a rebuilt
+    interface may renumber group sockets (id_map). A spec names every socket
+    whose name differs from its id, so a socket whose id now belongs to a
+    differently named socket is found by its name instead.
+    """
 
-    def props_of(e):
-        return (e.get("props") or {}).items()
+    def __init__(self, id_map=None):
+        self.id_map = id_map or {}
+        self.names = {}
 
-    # Socket ids can come out different from the spec's: recreated item lists
-    # (zones, capture, menu switch) number their sockets on. The spec names
-    # every socket whose name differs from its id, so a socket whose id now
-    # belongs to a differently named socket is found by its name instead.
-    spec_names = {(e["name"], side): {s["id"]: s["name"] for s in e.get(side, []) if "name" in s}
-                  for e in specs for side in ("inputs", "outputs")}
+    def add(self, specs):
+        for e in specs:
+            for side in ("inputs", "outputs"):
+                self.names[(e["name"], side)] = {s["id"]: s["name"] for s in e.get(side, []) if "name" in s}
 
-    def socket(node, key, output=False):
-        if node.bl_idname in {"NodeGroupInput", "NodeGroupOutput"} and key in id_map:
-            return find_socket(node, id_map[key], output)
-        name = spec_names[(node.name, "outputs" if output else "inputs")].get(key)
+    def get(self, node, key, output=False):
+        if node.bl_idname in {"NodeGroupInput", "NodeGroupOutput"} and key in self.id_map:
+            return find_socket(node, self.id_map[key], output)
+        name = self.names.get((node.name, "outputs" if output else "inputs"), {}).get(key)
         sockets = node.outputs if output else node.inputs
         by_id = next((s for s in sockets if s.identifier == key), None)
         if name is None or (by_id is not None and by_id.name == name):
@@ -1010,8 +1013,41 @@ def build(tree):
             return same_list[0]
         return find_socket(node, name, output)
 
+def set_input_values(node, inputs, sockets):
+    for s in inputs:
+        if "value" in s:
+            target = sockets.get(node, s["id"])
+            try:
+                set_socket_value(target, s["value"])
+            except (TypeError, ValueError, AttributeError) as ex:
+                raise GNError(f"node {node.name!r}, input {s['id']!r}: {ex}")
+
+def add_nodes(tree, specs, sockets):
+    """Add nodes given as specs to the tree; returns them by name."""
+    names = [e["name"] for e in specs]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise GNError(f"node names must be unique: {duplicates}")
+    taken = [n for n in names if n in tree.nodes]
+    if taken:
+        raise GNError(f"{tree.name!r} already has nodes named {taken}")
+    nodes = {}
+    for e in specs:
+        try:
+            node = tree.nodes.new(e["type"])
+        except RuntimeError as ex:
+            raise GNError(f"node {e['name']!r}: can't add a {e['type']!r} to a Geometry Nodes tree ({ex})")
+        node.name = e["name"]
+        node.label = e.get("label", "")
+        node.mute = e.get("mute", False)
+        nodes[e["name"]] = node
+    sockets.add(specs)
+
+    def props_of(e):
+        return (e.get("props") or {}).items()
+
     # Settings first (they decide which sockets exist), then zone pairs and
-    # item lists, then layout, input values and links.
+    # item lists, then layout and input values.
     for e in specs:
         node = nodes[e["name"]]
         for key, v in props_of(e):
@@ -1020,7 +1056,7 @@ def build(tree):
                 set_node_prop(node, key, v)
     for e in specs:
         output = (e.get("props") or {}).get("paired_output")
-        if output and not nodes[e["name"]].pair_with_output(node_named(output, f"zone {e['name']!r}")):
+        if output and not nodes[e["name"]].pair_with_output(find_node(tree, output)):
             raise GNError(f"can't pair zone input {e['name']!r} with {output!r}")
     for e in specs:
         node = nodes[e["name"]]
@@ -1031,27 +1067,75 @@ def build(tree):
     for e in specs:
         node = nodes[e["name"]]
         if e.get("parent"):
-            node.parent = node_named(e["parent"], f"node {e['name']!r}")
+            node.parent = find_node(tree, e["parent"])
         if "location" in e:
             node.location = e["location"]
     for e in specs:
-        node = nodes[e["name"]]
-        for s in e.get("inputs", []):
-            if "value" in s:
-                target = socket(node, s["id"])
-                try:
-                    set_socket_value(target, s["value"])
-                except (TypeError, ValueError, AttributeError) as ex:
-                    raise GNError(f"node {node.name!r}, input {s['id']!r}: {ex}")
-    links = spec.get("links", [])
+        set_input_values(nodes[e["name"]], e.get("inputs", []), sockets)
+    return nodes
+
+def add_link(tree, e, sockets):
+    (from_name, from_id), (to_name, to_id) = e["from"], e["to"]
+    link = tree.links.new(sockets.get(find_node(tree, from_name), from_id, output=True),
+                          sockets.get(find_node(tree, to_name), to_id))
+    if e.get("muted"):
+        link.is_muted = True
+    return link
+
+def add_links(tree, links, sockets):
     # Multi-input sockets order their links by when they were made.
     for _, e in sorted(enumerate(links), key=lambda il: (il[1].get("multi_input_sort_id", 0), il[0])):
-        (from_name, from_id), (to_name, to_id) = e["from"], e["to"]
-        from_node = node_named(from_name, f"link {e['from']} -> {e['to']}")
-        to_node = node_named(to_name, f"link {e['from']} -> {e['to']}")
-        link = tree.links.new(socket(from_node, from_id, output=True), socket(to_node, to_id))
-        if e.get("muted"):
-            link.is_muted = True
+        add_link(tree, e, sockets)
+
+def edit_summary(tree):
+    result = {"tree": tree.name, "nodes": len(tree.nodes), "links": len(tree.links)}
+    invalid = [[l.from_node.name, l.from_socket.identifier, l.to_node.name, l.to_socket.identifier]
+               for l in tree.links if not l.is_valid]
+    if invalid:
+        result["invalid_links"] = invalid
+    return result
+
+def replace_tree(original, work):
+    """Put work in original's place everywhere it is used, under its name."""
+    name = original.name
+    original.user_remap(work)
+    bpy.data.node_groups.remove(original)
+    work.name = name
+
+def edit_on_copy(original, edit):
+    """Run edit(copy); the copy replaces original only if edit returned."""
+    work = original.copy()
+    try:
+        result = edit(work)
+    except GNError as e:
+        # Errors name the tree; the user knows it by the original's name, not the copy's.
+        message = str(e).replace(repr(work.name), repr(original.name))
+        bpy.data.node_groups.remove(work)
+        raise GNError(message)
+    except BaseException:
+        bpy.data.node_groups.remove(work)
+        raise
+    replace_tree(original, work)
+    # Modifiers using the tree add properties for new interface inputs only when told.
+    work.interface_update(bpy.context)
+    return work, result
+'''
+
+
+# Builds a whole tree from a spec in gn_get_tree's format, on a copy that
+# replaces the original only once everything succeeded, so a bad spec leaves the
+# user's tree untouched. Interface sockets whose id matches an existing one are
+# kept, so values set on modifiers survive.
+GN_BUILD = _GN_COMMON + _GN_EDIT + r'''
+spec = ARGS["spec"]
+
+def build(tree):
+    id_map = sync_interface(tree, spec.get("interface", []))
+    tree.nodes.clear()
+    sockets = Sockets(id_map)
+    add_nodes(tree, spec.get("nodes", []), sockets)
+    add_links(tree, spec.get("links", []), sockets)
+    tree.description = spec.get("description", "")
     return id_map
 
 obj_name, mod_name, tree_name = ARGS.get("object"), ARGS.get("modifier"), ARGS.get("tree")
@@ -1073,21 +1157,19 @@ try:
     else:
         original = bpy.data.node_groups.get(tree_name)
     if original is not None:
-        check_gn_tree(original)
-    name = spec.get("name") or (original.name if original else tree_name or "Geometry Nodes")
-    work = original.copy() if original else bpy.data.node_groups.new(name, "GeometryNodeTree")
-    try:
-        id_map = build(work)
-    except BaseException:
-        bpy.data.node_groups.remove(work)
-        raise
+        work, id_map = edit_on_copy(check_gn_tree(original), build)
+    else:
+        work = bpy.data.node_groups.new(tree_name or "Geometry Nodes", "GeometryNodeTree")
+        try:
+            id_map = build(work)
+        except BaseException:
+            bpy.data.node_groups.remove(work)
+            raise
 except GNError as e:
     return {"error": str(e)}
 
-if original is not None:
-    original.user_remap(work)
-    bpy.data.node_groups.remove(original)
-work.name = name
+if spec.get("name"):
+    work.name = spec["name"]
 if "is_modifier" in spec:
     work.is_modifier = spec["is_modifier"]
 elif original is None:
@@ -1097,21 +1179,109 @@ if obj is not None:
         mod = obj.modifiers.new(mod_name or "GeometryNodes", "NODES")
     if mod.node_group != work:
         mod.node_group = work
-# Modifiers using the tree add properties for new interface inputs only when told.
-work.interface_update(bpy.context)
 
-result = {"tree": work.name, "nodes": len(work.nodes), "links": len(work.links),
-          "interface": [{"in_out": i.in_out, "name": i.name, "id": i.identifier}
-                        for i in work.interface.items_tree if i.item_type == "SOCKET"]}
+result = edit_summary(work)
+result["interface"] = [{"in_out": i.in_out, "name": i.name, "id": i.identifier}
+                       for i in work.interface.items_tree if i.item_type == "SOCKET"]
 changed_ids = {old: new for old, new in id_map.items() if old != new}
 if changed_ids:
     result["interface_id_changes"] = changed_ids
-invalid = [[l.from_node.name, l.from_socket.identifier, l.to_node.name, l.to_socket.identifier]
-           for l in work.links if not l.is_valid]
-if invalid:
-    result["invalid_links"] = invalid
 if obj is not None:
     result["modifier"] = {"object": obj.name, "name": mod.name}
+return result
+'''
+
+
+# Small edits to an existing tree, as a list of operations applied in order on a
+# copy that replaces the original only if every operation worked.
+GN_PATCH = _GN_COMMON + _GN_EDIT + r'''
+OPS = ("add_node", "remove_node", "link", "unlink", "set", "rename", "add_socket", "remove_socket")
+
+def interface_socket(tree, key):
+    items = [i for i in tree.interface.items_tree if i.item_type == "SOCKET"]
+    matches = [i for i in items if i.identifier == key] or [i for i in items if i.name == key]
+    if len(matches) != 1:
+        available = [f"{i.identifier} ({i.in_out.lower()} {i.name})" for i in items]
+        raise GNError(f"{'ambiguous' if matches else 'no'} interface socket {key!r}; sockets: {available}")
+    return matches[0]
+
+def apply(tree, op, sockets, added):
+    kind = op["op"]
+    if kind == "remove_node":
+        tree.nodes.remove(find_node(tree, op["name"]))
+    elif kind == "link":
+        add_link(tree, op, sockets)
+    elif kind == "unlink":
+        target = sockets.get(find_node(tree, op["to"][0]), op["to"][1])
+        source = sockets.get(find_node(tree, op["from"][0]), op["from"][1], output=True) if op.get("from") else None
+        links = [l for l in target.links if source is None or l.from_socket == source]
+        if not links:
+            raise GNError(f"no link into {op['to']}" + (f" from {op['from']}" if source else ""))
+        for link in links:
+            tree.links.remove(link)
+    elif kind == "set":
+        node = find_node(tree, op["name"])
+        if "label" in op:
+            node.label = op["label"]
+        if "mute" in op:
+            node.mute = op["mute"]
+        if "parent" in op:
+            node.parent = find_node(tree, op["parent"]) if op["parent"] else None
+        if "location" in op:
+            node.location = op["location"]
+        for key, v in (op.get("props") or {}).items():
+            set_node_prop(node, key, v)
+        set_input_values(node, op.get("inputs", []), sockets)
+    elif kind == "rename":
+        node = find_node(tree, op["name"])
+        if op["new_name"] in tree.nodes:
+            raise GNError(f"{tree.name!r} already has a node named {op['new_name']!r}")
+        node.name = op["new_name"]
+    elif kind == "add_socket":
+        item = tree.interface.new_socket(op["name"], in_out=op["in_out"], socket_type=op["type"])
+        set_interface_socket(item, op)
+        if op.get("in_panel"):
+            panel = interface_panel(tree, op["in_panel"])
+            size = sum(1 for i in tree.interface.items_tree if i.parent == panel)
+            tree.interface.move_to_parent(item, panel, size)
+        added[item.name] = item.identifier
+    elif kind == "remove_socket":
+        tree.interface.remove(interface_socket(tree, op["id"]))
+    else:
+        raise GNError(f"unknown op {kind!r}; ops are {list(OPS)}")
+
+def patch(tree):
+    sockets, added = Sockets(), {}
+    pending = []  # consecutive add_node ops, added together so zones can pair up
+    def flush():
+        if pending:
+            first = pending[0][0]
+            try:
+                add_nodes(tree, [spec for _, spec in pending], sockets)
+            except GNError as e:
+                raise GNError(f"op {first} (add_node): {e}")
+            pending.clear()
+    for index, op in enumerate(ARGS["ops"]):
+        if op.get("op") == "add_node":
+            pending.append((index, {k: v for k, v in op.items() if k != "op"}))
+            continue
+        flush()
+        try:
+            apply(tree, op, sockets, added)
+        except (GNError, KeyError, TypeError, ValueError, RuntimeError) as e:
+            raise GNError(f"op {index} ({op.get('op')}): {e}")
+    flush()
+    return added
+
+try:
+    tree, obj, mod = find_tree(ARGS)
+    work, added = edit_on_copy(tree, patch)
+except GNError as e:
+    return {"error": str(e)}
+result = edit_summary(work)
+result["ops"] = len(ARGS["ops"])
+if added:
+    result["added_sockets"] = added
 return result
 '''
 

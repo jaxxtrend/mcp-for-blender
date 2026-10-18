@@ -785,6 +785,52 @@ async def gn_build_tree(
 
 
 @mcp.tool()
+async def gn_patch_tree(
+    ctx: Context,
+    ops: list[dict],
+    object: str | None = None,
+    modifier: str | None = None,
+    tree: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Make small edits to a Geometry Nodes tree without sending it whole: a list of operations
+    applied in order. For big changes, or a new tree, use gn_build_tree. Give exactly one of
+    object or tree, as in gn_get_tree.
+
+    Operations (socket ids or names, as in gn_get_tree):
+    - {"op": "add_node", "name", "type", "location"?, "label"?, "parent"?, "props"?, "inputs"?}
+      Same fields as a node in gn_build_tree. Add a zone's output before its input, which pairs
+      with props {"paired_output": name}.
+    - {"op": "remove_node", "name"}
+    - {"op": "link", "from": [node, output], "to": [node, input], "muted"?}  Replaces the link
+      already into a single input.
+    - {"op": "unlink", "to": [node, input], "from"?: [node, output]}  Without from: every link
+      into that input.
+    - {"op": "set", "name", "props"?, "inputs"?: [{"id", "value"}], "label"?, "location"?,
+      "parent"? (null to unparent), "mute"?}
+    - {"op": "rename", "name", "new_name"}
+    - {"op": "add_socket", "in_out", "name", "type", "default"?, "min"?, "max"?, "description"?,
+      "in_panel"?}  An interface socket; the result lists its id.
+    - {"op": "remove_socket", "id"}  By id or name.
+
+    Works on a copy that replaces the tree only if every operation worked; an error names the
+    failed operation by index and changes nothing.
+
+    Parameters:
+    - ops: The operations.
+    - object / modifier / tree: Which tree, as in gn_get_tree.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if bool(object) == bool(tree):
+        return "Error: give exactly one of object or tree"
+    if not ops:
+        return "Error: no ops given"
+    return _gn_reply(blender_scripts.GN_PATCH, {"ops": ops, "object": object, "modifier": modifier, "tree": tree},
+                     "patching node tree", read_only=False)
+
+
+@mcp.tool()
 async def gn_set_inputs(
     ctx: Context,
     object: str | None = None,

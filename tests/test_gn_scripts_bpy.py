@@ -177,3 +177,22 @@ def test_read_attribute():
     position = run(blender_scripts.GN_READ_ATTRIBUTE, object="Ground", name="position")["components"]
     assert position["mesh"]["count"] == 4 and position["mesh"]["min"] == [-2.0, -2.0, 0.0]
     assert "no attribute 'nope'" in run(blender_scripts.GN_READ_ATTRIBUTE, object="Ground", name="nope")["error"]
+
+
+def test_patch_applies_ops_in_order_or_not_at_all():
+    scatter_scene()
+    reply = run(blender_scripts.GN_PATCH, object="Ground", ops=[
+        {"op": "add_node", "name": "Realize", "type": "GeometryNodeRealizeInstances"},
+        {"op": "link", "from": ["Join Geometry", "Geometry"], "to": ["Realize", "Geometry"]},
+        {"op": "link", "from": ["Realize", "Geometry"], "to": ["Group Output", "Geometry"]},
+        {"op": "add_socket", "in_out": "INPUT", "name": "Seed", "type": "NodeSocketInt", "default": 7},
+    ])
+    assert reply["ops"] == 4 and "Seed" in reply["added_sockets"]
+    info = run(blender_scripts.GN_EVALUATED, object="Ground")
+    assert "instances" not in info and info["mesh"]["faces"] == 1 + 400 * 6
+    before = get(object="Ground")
+    reply = run(blender_scripts.GN_PATCH, object="Ground", ops=[
+        {"op": "remove_node", "name": "Realize"}, {"op": "rename", "name": "Cube", "new_name": "Join Geometry"}])
+    assert reply["error"] == "op 1 (rename): 'Scatter' already has a node named 'Join Geometry'"
+    assert get(object="Ground") == before
+    assert sorted(g.name for g in bpy.data.node_groups) == ["Scatter"]

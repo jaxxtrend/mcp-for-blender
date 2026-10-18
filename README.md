@@ -640,6 +640,7 @@ The AI writes Blender Python itself for modelling, layout, materials, animation,
 | `search_assets` / `import_asset` | [Poly Haven](https://polyhaven.com/) HDRIs, textures and models, [Sketchfab](https://sketchfab.com/) models, [Poly Pizza](https://poly.pizza/) low-poly models |
 | `get_addon_status` | Blender version, addon version, and which libraries and generators are switched on |
 | `gn_get_tree` / `gn_build_tree` | Read a Geometry Nodes tree as JSON (interface, nodes, settings, values, links), and build or rebuild a whole tree from that JSON in one call. A failed build leaves the tree as it was |
+| `gn_patch_tree` | Small edits as a list of operations (add/remove/rename nodes, link/unlink, set values, add/remove interface sockets), all or nothing |
 | `gn_set_inputs` | Change modifier inputs (values or attributes), node input values and node settings in place |
 | `gn_list_node_types` | Node types this Blender version has, or one type's settings and sockets for a given mode |
 | `gn_get_evaluated_info` | What the modifiers produced: counts, attributes, instances and the bounding box (Blender 4.3+) |
