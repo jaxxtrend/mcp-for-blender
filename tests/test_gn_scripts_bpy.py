@@ -265,3 +265,23 @@ def test_preview_field_draws_a_noise(tmp_path):
     bpy.data.images.remove(image)
     assert (len(bpy.data.node_groups), len(bpy.data.objects), len(bpy.data.images)) == (groups, objects, images)
     assert "GEOMETRY" in run(blender_scripts.GN_PREVIEW, object="Ground", node="Cube", socket="Mesh", filepath=path)["error"]
+
+
+def test_apply_group_and_save_it_as_a_user_asset(tmp_path):
+    ground, _ = scatter_scene()
+    ground.modifiers.clear()
+    applied = run(blender_scripts.GN_APPLY_GROUP, object="Ground", group="Scatter", inputs={"Density": 4.0})
+    assert applied["modifier"] == "Scatter" and {v["name"]: v["value"] for v in applied["inputs"].values()} == {"Density": 4.0}
+    assert run(blender_scripts.GN_EVALUATED, object="Ground")["instances"]["count"] == 64
+    assert "already has a modifier" in run(blender_scripts.GN_APPLY_GROUP, object="Ground", group="Scatter")["error"]
+    path = str(tmp_path / "scatter.blend")
+    saved = run(blender_scripts.GN_SAVE_ASSET, tree="Scatter", description="Scatter cubes", tags=["mcp"], write_to=path)
+    assert saved["written"] == path and saved["tags"] == ["mcp"]
+    assert "exists" in run(blender_scripts.GN_SAVE_ASSET, tree="Scatter", write_to=path)["error"]
+    bpy.ops.preferences.asset_library_add(directory=str(tmp_path))
+    try:
+        listed = run(blender_scripts.GN_ASSETS, source="user")["assets"]
+        assert [(a["name"], a["description"]) for a in listed] == [("Scatter", "Scatter cubes")]
+    finally:
+        libraries = bpy.context.preferences.filepaths.asset_libraries
+        libraries.remove(libraries[-1])

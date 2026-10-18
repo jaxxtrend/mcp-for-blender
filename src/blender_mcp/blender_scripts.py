@@ -857,6 +857,46 @@ def dump_tree(tree):
         out["uses_groups"] = groups
     return out
 
+def modifier_input_values(mod, tree):
+    out = {}
+    for item in tree.interface.items_tree:
+        if item.item_type != "SOCKET" or item.in_out != "INPUT" or item.identifier not in mod.keys():
+            continue
+        entry = {"name": item.name, "value": value(mod[item.identifier])}
+        if mod.get(item.identifier + "_use_attribute"):
+            entry["attribute"] = mod[item.identifier + "_attribute_name"]
+        out[item.identifier] = entry
+    return out
+
+def set_modifier_inputs(obj, mod, tree, inputs, changed):
+    """Set modifier inputs by interface id or name: a value, or {"attribute": name} for a field input."""
+    items = [i for i in tree.interface.items_tree if i.item_type == "SOCKET" and i.in_out == "INPUT"]
+    for key, v in inputs.items():
+        matches = [i for i in items if i.identifier == key] or [i for i in items if i.name == key]
+        if len(matches) != 1:
+            available = [f"{i.identifier} ({i.name})" for i in items]
+            raise GNError(f"{'ambiguous' if matches else 'no'} modifier input {key!r}; inputs: {available}")
+        item = matches[0]
+        ident = item.identifier
+        if ident not in mod.keys():
+            raise GNError(f"input {item.name!r} ({item.socket_type}) has no value on the modifier")
+        if isinstance(v, dict):
+            if set(v) != {"attribute"} or ident + "_use_attribute" not in mod.keys():
+                raise GNError(f"input {item.name!r}: a dict value must be {{\"attribute\": name}} on a field input")
+            mod[ident + "_use_attribute"] = True
+            mod[ident + "_attribute_name"] = v["attribute"]
+        else:
+            if ident + "_use_attribute" in mod.keys():
+                mod[ident + "_use_attribute"] = False
+            try:
+                mod[ident] = to_socket_value(item.socket_type, v)
+            except (TypeError, ValueError) as e:
+                raise GNError(f"modifier input {item.name!r}: {e}")
+        changed.append(f"modifier.{ident}")
+    if inputs:
+        # Setting modifier properties from Python doesn't re-evaluate the object by itself.
+        obj.update_tag()
+
 def node_classes():
     for name in dir(bpy.types):
         cls = getattr(bpy.types, name)
@@ -877,15 +917,7 @@ except GNError as e:
 
 result = {}
 if mod is not None:
-    inputs = {}
-    for item in tree.interface.items_tree:
-        if item.item_type != "SOCKET" or item.in_out != "INPUT" or item.identifier not in mod.keys():
-            continue
-        entry = {"name": item.name, "value": value(mod[item.identifier])}
-        if mod.get(item.identifier + "_use_attribute"):
-            entry["attribute"] = mod[item.identifier + "_attribute_name"]
-        inputs[item.identifier] = entry
-    result["modifier"] = {"object": obj.name, "name": mod.name, "inputs": inputs}
+    result["modifier"] = {"object": obj.name, "name": mod.name, "inputs": modifier_input_values(mod, tree)}
 
 result["tree"] = dump_tree(tree)
 if ARGS.get("include_nested"):
@@ -1309,32 +1341,7 @@ try:
     modifier_inputs = ARGS.get("modifier_inputs") or {}
     if modifier_inputs and mod is None:
         raise GNError("modifier_inputs need object=, the object whose modifier to change")
-    items = [i for i in tree.interface.items_tree if i.item_type == "SOCKET" and i.in_out == "INPUT"]
-    for key, v in modifier_inputs.items():
-        matches = [i for i in items if i.identifier == key] or [i for i in items if i.name == key]
-        if len(matches) != 1:
-            available = [f"{i.identifier} ({i.name})" for i in items]
-            raise GNError(f"{'ambiguous' if matches else 'no'} modifier input {key!r}; inputs: {available}")
-        item = matches[0]
-        ident = item.identifier
-        if ident not in mod.keys():
-            raise GNError(f"input {item.name!r} ({item.socket_type}) has no value on the modifier")
-        if isinstance(v, dict):
-            if set(v) != {"attribute"} or ident + "_use_attribute" not in mod.keys():
-                raise GNError(f"input {item.name!r}: a dict value must be {{\"attribute\": name}} on a field input")
-            mod[ident + "_use_attribute"] = True
-            mod[ident + "_attribute_name"] = v["attribute"]
-        else:
-            if ident + "_use_attribute" in mod.keys():
-                mod[ident + "_use_attribute"] = False
-            try:
-                mod[ident] = to_socket_value(item.socket_type, v)
-            except (TypeError, ValueError) as e:
-                raise GNError(f"modifier input {item.name!r}: {e}")
-        changed.append(f"modifier.{ident}")
-    if modifier_inputs:
-        # Setting modifier properties from Python doesn't re-evaluate the object by itself.
-        obj.update_tag()
+    set_modifier_inputs(obj, mod, tree, modifier_inputs, changed)
 except GNError as e:
     return {"error": str(e), "changed": changed}
 return {"changed": changed}
@@ -2139,4 +2146,74 @@ finally:
     bpy.data.objects.remove(holder)
     bpy.data.meshes.remove(mesh)
     bpy.data.node_groups.remove(work)
+'''
+
+
+# Puts an existing Geometry Nodes group on an object as a new modifier and sets
+# its inputs: one call to use any group, the user's or an asset's.
+GN_APPLY_GROUP = _GN_COMMON + r'''
+try:
+    obj = find_object(ARGS["object"])
+    group = bpy.data.node_groups.get(ARGS["group"])
+    if group is None:
+        raise GNError(f"no node group named {ARGS['group']!r}")
+    check_gn_tree(group)
+    name = ARGS.get("modifier") or group.name
+    if name in obj.modifiers:
+        raise GNError(f"{obj.name!r} already has a modifier named {name!r}")
+    mod = obj.modifiers.new(name, "NODES")
+    if mod is None:
+        raise GNError(f"a {obj.type} object can't have a Geometry Nodes modifier")
+    try:
+        mod.node_group = group
+        set_modifier_inputs(obj, mod, group, ARGS.get("inputs") or {}, [])
+    except BaseException:
+        obj.modifiers.remove(mod)
+        raise
+    return {"object": obj.name, "modifier": mod.name, "group": group.name,
+            "position": list(obj.modifiers).index(mod), "inputs": modifier_input_values(mod, group)}
+except GNError as e:
+    return {"error": str(e)}
+'''
+
+
+# Marks a group as an asset with a description and tags, and optionally writes it
+# (with the groups it uses) to its own .blend file, e.g. in an asset library
+# folder, so other files can use it.
+GN_SAVE_ASSET = _GN_COMMON + r'''
+import os
+try:
+    tree = bpy.data.node_groups.get(ARGS["tree"])
+    if tree is None:
+        raise GNError(f"no node group named {ARGS['tree']!r}")
+    check_gn_tree(tree)
+    if tree.library:
+        raise GNError(f"{tree.name!r} is linked from {tree.library.filepath}; mark it as an asset there")
+    path = ARGS.get("write_to")
+    if path:
+        path = os.path.abspath(bpy.path.abspath(path))
+        if not path.endswith(".blend"):
+            raise GNError("write_to must be a .blend file path")
+        if not os.path.isdir(os.path.dirname(path)):
+            raise GNError(f"folder {os.path.dirname(path)!r} doesn't exist")
+        if os.path.exists(path) and not ARGS.get("overwrite"):
+            raise GNError(f"{path!r} exists; pass overwrite=true to replace it")
+    tree.asset_mark()
+    data = tree.asset_data
+    if ARGS.get("description") is not None:
+        data.description = ARGS["description"]
+    for tag in ARGS.get("tags") or []:
+        if tag not in data.tags:
+            data.tags.new(tag)
+    if ARGS.get("is_modifier") is not None:
+        tree.is_modifier = ARGS["is_modifier"]
+    result = {"tree": tree.name, "asset": True, "description": data.description,
+              "tags": [t.name for t in data.tags], "is_modifier": tree.is_modifier}
+    if path:
+        bpy.data.libraries.write(path, {tree}, fake_user=True)
+        result["written"] = path
+    result["user_libraries"] = [[lib.name, lib.path] for lib in bpy.context.preferences.filepaths.asset_libraries]
+    return result
+except GNError as e:
+    return {"error": str(e)}
 '''

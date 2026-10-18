@@ -1171,6 +1171,65 @@ async def gn_preview_field(
     return CallToolResult(content=[_png_content(png), TextContent(type="text", text=json.dumps(info))])
 
 
+@mcp.tool()
+async def gn_apply_group(
+    ctx: Context,
+    object: str,
+    group: str,
+    inputs: dict | None = None,
+    modifier: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Put an existing Geometry Nodes group on an object as a new modifier (at the end of the stack)
+    and set its inputs in one call: the way to use a group you built, the user's own, or one from
+    gn_node_assets. The group's interface is its controls: change them later with gn_set_inputs.
+
+    Parameters:
+    - object: The object to add the modifier to.
+    - group: Node group name.
+    - inputs: {input id or name: value}, as modifier_inputs in gn_set_inputs.
+    - modifier: The new modifier's name (default the group's name).
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_APPLY_GROUP, {"object": object, "group": group, "inputs": inputs,
+                                                      "modifier": modifier}, "applying group", read_only=False)
+
+
+@mcp.tool()
+async def gn_save_as_asset(
+    ctx: Context,
+    tree: str,
+    description: str | None = None,
+    tags: list[str] | None = None,
+    is_modifier: bool | None = None,
+    write_to: str | None = None,
+    overwrite: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Mark a Geometry Nodes group as an asset, so it shows in Blender's asset browser and Add menu,
+    with a description and tags. With write_to, also save it (and the groups it uses) to its own
+    .blend file; put that file in one of the user's asset libraries (the result lists them) to use
+    the group from any file, through the asset browser or gn_node_assets(source="user").
+
+    Give the group's inputs descriptions, sensible defaults and min/max first (gn_build_tree or
+    gn_patch_tree), since they are what users of the asset see.
+
+    Parameters:
+    - tree: Node group name.
+    - description: Asset description.
+    - tags: Tags to add.
+    - is_modifier: Whether it appears as a modifier in the Add Modifier menu.
+    - write_to: Path of a .blend file to write the group to. The folder must exist.
+    - overwrite: Replace write_to if it exists.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    return _gn_reply(blender_scripts.GN_SAVE_ASSET, {
+        "tree": tree, "description": description, "tags": tags, "is_modifier": is_modifier, "write_to": write_to,
+        "overwrite": overwrite}, "saving asset", read_only=False)
+
+
 def _capture_viewport(max_size: int) -> tuple[bytes, dict]:
     """Have the addon render the viewport to a temp file.
 
